@@ -72,3 +72,9 @@ results/
 output/
 trained_models/
 cached_files/
+
+# 数据集
+benchmark/long_bench/data
+
+# 输出
+pred

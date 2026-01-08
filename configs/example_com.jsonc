@@ -1,0 +1,57 @@
+{
+    // 用于 KV 缓存卸载（Offloading）时的 CPU 线程数，控制数据传输的并发度
+    "cpu_num_threads": 8,
+
+    // 是否应用模型的对话模板（Chat Template）。通常在 CoT 或特定对话任务时开启
+    "use_chat_template": false,
+
+    // 是否开启思维链（Chain of Thought）推理模式
+    "cot": false,
+
+    // 允许的最大上下文 Token 长度，超过此长度会根据策略进行截断
+    "max_context_len": 128500,
+
+    // 模型权重文件的本地路径或 HuggingFace ID
+    "model_name": "../models/Llama-3-8B-Instruct-262k",
+
+    // 是否启用 8-bit 权重量化（减少显存占用，但会有轻微精度损失）
+    "load_in_8bit": false,
+
+    // 是否启用 4-bit 权重量化
+    "load_in_4bit": false,
+
+    // OmniKV 的模型实现类，默认为 "multi" 以支持动态选择逻辑
+    "model_cls": "multi",
+
+    // KV Cache 的管理类，默认为 "multi" 以配合动态选择逻辑
+    "cache_cls": "multi",
+
+    // 是否使用 Flash Attention 2 加速预填充（Prefill）阶段
+    "use_flash_attn": true,
+
+    // 核心参数：指定哪些层作为“过滤层”（Filter Layers）来计算注意力分数并选择重要 Token
+    // 多个层索引以字符串形式传入，例如 "2, 8, 18"
+    "do_select_layers": "2,8,18",
+
+    // 在过滤层选出重要 Token 后，紧接着有多少层也保留全部 KV 缓存，用以缓冲从 CPU 读取的时间
+    "num_wait_load_layers": 1,
+
+    // 是否执行真实的显存到内存卸载。显存充足时可设为 false 仅模拟逻辑以换取更高速度
+    "real_offload": false,
+
+    // 若设为 true，会让 wait_load_layers 执行完整的 Dense Attention，以配合较慢的 CPU 吞吐
+    "dense_more": true,
+
+    // 每个过滤层选出的 Token 比例或绝对数量。
+    // 如果是浮点数（如 0.067），表示保留序列长度的 6.7%；如果是整数，表示保留固定数量。
+    "num_of_selected_tokens": 0.067,
+
+    // Token 选择器的算法类型：
+    // "last": 仅基于当前生成的最后一个 Token 的注意力分数
+    // "uniform": 在滑动窗口内均匀计算
+    // "exp": 使用指数加权衰减的注意力分数
+    "selector_cls": "last",
+
+    // 当使用 "uniform" 或 "exp" 选择器时，计算重要性分数的观测窗口大小
+    "window_size": 16
+}

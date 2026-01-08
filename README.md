@@ -25,7 +25,7 @@ torch>=2.1.0
 transformers==4.41.2  # newer version may have compatibility issues
 omegaconf
 flash-attn
-rougea
+rouge
 fuzzywuzzy
 jieba
 ```

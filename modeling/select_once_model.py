@@ -43,7 +43,7 @@ def select_tokens_by_attn(raw_attn, hidden_states, position_ids, past_key_value:
     key_states = past_key_value.key_cache[raw_attn.layer_idx]
 
     key_states = repeat_kv(key_states, raw_attn.num_key_value_groups)
-    attn_weights = torch.matmul(query_states, key_states.transpose(2, 3)) / math.sqrt(raw_attn.head_dim)
+    attn_weights = torch.matmul(query_states, key_states.transpose(2, 3)) / math.sqrt(raw_attn.head_dim)  # 注意力计算
 
     attn_weights = torch.max(attn_weights[..., -1, :], dim=1).values
     # attn_weights = attn_weights[..., -1, :]

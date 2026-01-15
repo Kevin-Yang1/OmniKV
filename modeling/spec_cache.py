@@ -318,63 +318,130 @@ class DynamicSubOffloadTrueCache(transformers.cache_utils.DynamicCache):
 
 class OmniKVMultiStageCache(transformers.cache_utils.DynamicCache):
     """
-    OmniKV 多阶段动态缓存。
-    
-    支持将模型层划分为多个阶段，每个阶段可以有不同的 KV 留存策略和 CPU 卸载策略。
-    主要用于处理多层过滤的情境。
+    OmniKV 多阶段动态缓存类。
+
+    该类实现了复杂的缓存管理策略，支持将 KV Cache 分为不同的阶段进行处理。
+    它允许根据预定义的 `full_attn_layers` (全量注意力层) 将模型划分为多个片段。
+    在每个片段中，部分层保留在 GPU 上用于计算 Token 重要性索引，
+    而后续层可以暂时卸载 (Offload) 到 CPU，待索引确定后再按需加载回 GPU。
     """
+
     def __init__(
         self,
-        full_attn_layers: List,
-        num_hidden_layers,
-        num_wait_load_layers=2,
-        real_offload=True,
+        full_attn_layers: List[int],
+        num_hidden_layers: int,
+        num_wait_load_layers: int = 2,
+        real_offload: bool = True,
     ):
+        """
+        初始化多阶段缓存管理器。
+
+        Args:
+            full_attn_layers (List[int]):
+                全量注意力层的索引列表。这些层负责计算 Token 的重要性得分。
+                通常是模型中的关键层，比如 [2, 10, 20]。
+            num_hidden_layers (int):
+                模型的总隐藏层数。
+            num_wait_load_layers (int, optional, defaults to 2):
+                在每个全量注意力层之后，需要保留在 GPU 上等待索引计算完成的缓冲层数。
+                这些层不会被卸载，因为它们可能在搬运数据完成前就需要进行计算。
+            real_offload (bool, optional, defaults to True):
+                是否开启真正的 CPU 卸载。
+                - True: 将非关键层的 KV Cache 移动到 CPU 内存 (System RAM)。
+                - False: 仅保留引用，不实际移动数据 (通常用于调试或显存充足的情况)。
+
+        Returns:
+            None
+        """
         super().__init__()
+        # 当前所处的阶段: "prefill" (预填充) 或 "decoding" (解码)
         self.stage = "prefill"
-        self.full_attn_layers = full_attn_layers # 触发全量注意力的层索引列表
+        self.full_attn_layers = full_attn_layers
         self.num_hidden_layers = num_hidden_layers
-        self.num_wait_layers = num_wait_load_layers # 触发选择后等待加载的层数
+        self.num_wait_layers = num_wait_load_layers
+        
+        # 存储每一层的状态配置 (need_offload, start_layer, end_layer)
         self.layer_state = {} 
         self.need_cat_layers = []
+        # 根据配置决定卸载的目标设备 (CPU 或 None)
         self.device = "cpu" if real_offload else None
         
-        # 构建层状态机：确定哪些层需要全量缓存，哪些层需要卸载，哪些层是子集缓存
+        # [构建层状态机]
+        # 遍历每一个全量注意力层 (作为阶段的起点)
         for _l in self.full_attn_layers:
+            # _r 表示当前阶段的结束层索引，初始化为模型最后一层
             _r = num_hidden_layers
+            # 寻找下一个全量注意力层的位置，作为当前阶段的终点
             for i in range(_l + 1, self.num_hidden_layers):
                 if i in self.full_attn_layers:
                     _r = i
                     break
-            # _l 到 _l + num_wait_layers 之间的层保持在 GPU 上（等待索引计算）
+            
+            # 第一部分: 保留层 (Retained Layers)
+            # 从 _l 到 _l + num_wait_layers 的层，即便不是全量层，也保留在 GPU 上。
+            # 这是为了掩盖数据搬运的延迟 (Overlap communication and computation)。
             for i in range(_l, min(_r, _l + self.num_wait_layers + 1)):
-                self.layer_state[i] = (False, _l, _r) # False 表示不需要 offload
-            # 后续的层可以卸载到 CPU，直到下一个 full_attn_layer
+                # 状态格式: (是否需要卸载, 当前阶段起点, 当前阶段终点)
+                self.layer_state[i] = (False, _l, _r) 
+            
+            # 第二部分: 卸载层 (Offload Layers)
+            # 超过缓冲区的层，可以安全地卸载到 CPU，直到下一个阶段开始。
             for i in range(min(_r, _l + self.num_wait_layers + 1), _r):
                 self.layer_state[i] = (True, _l, _r)  # True 表示需要 offload
 
+        # 用于存储从 CPU 搬运回 GPU 的部分 KV (根据索引筛选后的)
         self.part_key = {}
         self.part_value = {}
+        
+        # 用于存储 Decoding 阶段新生成的 KV (Tail 部分)
+        # 这些新 Token 必须始终保留在 GPU 上以便自回归生成
         self.tail_k = {}
         self.tail_v = {}
+        
+        # 虽然定义了 mamba_k/v，但在当前类实现中主要使用 part/tail 字典
         self.mamba_k = {}
         self.mamba_v = {}
 
-    def set_idx_on_gpu(self, idx, sel_layer_idx):
+    def set_idx_on_gpu(self, idx: torch.Tensor, sel_layer_idx: int) -> None:
         """
-        在 GPU 上通过索引选取指定范围层的 KV 缓存。
+        [异步处理] 在 GPU 上应用索引选择，从完整缓存中提取需要的 KV 子集。
+
+        功能:
+        当某个全量注意力层 (`sel_layer_idx`) 完成计算并生成了 Token 保留索引 (`idx`) 后，
+        该函数会立即被调用。它根据索引 `idx` 从全量 (可能是卸载到 CPU 的) KV 中筛选出部分 KV (`part_key`)，
+        并将其搬运到 GPU 上，供后续层使用。
+
+        Args:
+            idx (torch.Tensor):
+                选中的 Token 索引张量。
+            sel_layer_idx (int):
+                生成该索引的全量注意力层 ID ('filter layer')。
+
+        Returns:
+            None
         """
         st = time.time()
+        # 展平索引
         _idx = idx.view(-1)
+        
+        # 如果配置了 CPU 卸载，确保索引也在 CPU 上以便进行 CPU 端的 index_select
         if self.device == "cpu":
             _idx = _idx.cpu()
             
-        # 找到受该索引影响的层范围
+        # 获取当前阶段的结束层索引
+        # self.layer_state[i] = (False/True, start, end)
         _r = self.layer_state[sel_layer_idx][2]
+        
+        # 计算受影响的起始层: 跳过缓冲层 (wait_layers)
+        # 只有真正被卸载的层才需要"恢复"
         sid = sel_layer_idx + self.num_wait_layers + 1
         
-        # 批量执行索引选择并送回 GPU
+        # 遍历当前阶段所有被卸载的层
         for i in range(sid, _r):
+            # 1. index_select: 根据 _idx 筛选出重要的 KV 对。
+            #    如果 self.key_cache[i] 在 CPU，这一步在 CPU 执行。
+            # 2. .cuda(non_blocking=True): 将筛选后的结果异步传输到 GPU。
+            # 3. 保存到 self.part_key/part_value 供 update 函数在 decoding 时使用。
             self.part_key[i] = torch.index_select(self.key_cache[i], 2, _idx).cuda(
                 non_blocking=True
             )
@@ -393,16 +460,43 @@ class OmniKVMultiStageCache(transformers.cache_utils.DynamicCache):
         cache_kwargs: Optional[Dict[str, Any]] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """
-        根据层状态更新缓存。
+        更新 KV 缓存并在 Decoding 阶段返回组合后的缓存。
+
+        在 Prefill 阶段:
+        - 将 KV 存入缓存列表。
+        - 根据 layer_state 决定是否卸载到 CPU。
+
+        在 Decoding 阶段:
+        - 维护新生成的 KV (Tail 部分)。
+        - 对于卸载层，组合 "历史筛选部分 (Part)" + "新生成部分 (Tail)" 返回给模型进行 Attention 计算。
+        - 对于非卸载层，返回全量缓存。
+
+        Args:
+            key_states (torch.Tensor): 新的 Key 张量。
+            value_states (torch.Tensor): 新的 Value 张量。
+            layer_idx (int): 当前层索引。
+            cache_kwargs (Optional[Dict[str, Any]]): 额外参数 (未使用)。
+
+        Returns:
+            Tuple[torch.Tensor, torch.Tensor]:
+            用于当前层 Attention 计算的 (Key, Value) 状态。
+            注意：对于卸载层，返回的是压缩后的视图，而非全量历史。
         """
+        # 统计 Token (仅在第0层)
         if layer_idx == 0:
             self._seen_tokens += key_states.shape[-2]
 
-        if self.layer_state[layer_idx][0]:  # 如果该层被标记为需要 offload
+        # 检查该层是否配置为卸载层 (Offload Layer)
+        # self.layer_state[layer_idx][0] 为 True 表示需要卸载
+        # 如果开启了卸载功能（real_offload: true），卸载层会卸载到 CPU，非卸载层仍在 GPU
+        if self.layer_state[layer_idx][0]:
             if self.stage == "prefill":
-                # Prefill 阶段：卸载到指定设备
+                # === Prefill 阶段 ===
                 st = time.time()
                 is_last_layer = layer_idx == self.num_hidden_layers - 1
+                
+                # 将 Tensor 移动到指定设备 (通常是 CPU)，和 self 所在位置相同
+                # 使用 non_blocking=True 除非是最后一层 (确保同步)
                 _key = key_states.to(
                     device=self.device if self.device else key_states.device,
                     non_blocking=not is_last_layer,
@@ -412,18 +506,24 @@ class OmniKVMultiStageCache(transformers.cache_utils.DynamicCache):
                     non_blocking=not is_last_layer,
                 )
 
+                # 存入列表
                 self.key_cache.append(_key)
                 self.value_cache.append(_value)
+                
                 logger.info(
                     f"Layer={layer_idx} offload to cpu {round(time.time() - st, 3)}s"
                 )
+                # Prefill 阶段通常返回原始输入即可，不需要读取历史
                 return key_states, value_states
             else:
-                # Decoding 阶段：拼接选中的历史 KV 和新生成的 Tail KV
+                # === Decoding 阶段 ===
+                # 1. 更新 Tail Cache (存储 Decoding 阶段新生成的 Token)
                 if layer_idx not in self.tail_k:
+                    # 第一次生成
                     self.tail_k[layer_idx] = key_states
                     self.tail_v[layer_idx] = value_states
                 else:
+                    # 后续生成，拼接
                     self.tail_k[layer_idx] = torch.cat(
                         [self.tail_k[layer_idx], key_states], dim=-2
                     )
@@ -431,6 +531,10 @@ class OmniKVMultiStageCache(transformers.cache_utils.DynamicCache):
                         [self.tail_v[layer_idx], value_states], dim=-2
                     )
 
+                # 2. 拼接 "筛选出的历史 KV (Part)" 和 "新生成的 KV (Tail)"
+                # Part 部分由 `set_idx_on_gpu` 异步准备好
+                # Tail 部分一直在 GPU 上
+                # 返回拼接结果供 Attention 使用
                 return (
                     torch.cat(
                         [self.part_key[layer_idx], self.tail_k[layer_idx]], dim=-2
@@ -441,7 +545,8 @@ class OmniKVMultiStageCache(transformers.cache_utils.DynamicCache):
                 )
 
         else:
-            # 标准层（非卸载层）：正常维护 KV 缓存
+            # === 标准层 (非卸载层) ===
+            # 这些层保留全量 KV，行为与标准 DynamicCache 一致
             if len(self.key_cache) <= layer_idx:
                 self.key_cache.append(key_states)
                 self.value_cache.append(value_states)
@@ -457,11 +562,30 @@ class OmniKVMultiStageCache(transformers.cache_utils.DynamicCache):
     @staticmethod
     def from_dynamic_cache(
         cache: transformers.cache_utils.DynamicCache,
-        full_attn_layers: List,
-        num_hidden_layers,
-        num_wait_load_layers=2,
-        real_offload=True,
-    ):
+        full_attn_layers: List[int],
+        num_hidden_layers: int,
+        num_wait_load_layers: int = 2,
+        real_offload: bool = True,
+    ) -> "OmniKVMultiStageCache":
+        """
+        [工厂方法] 从一个现有的 `DynamicCache` 实例创建一个 `OmniKVMultiStageCache`。
+        通常用于将标准缓存转换为 OmniKV 管理的缓存。
+
+        Args:
+            cache (DynamicCache): 
+                源缓存对象，包含已有的 key_cache/value_cache。
+            full_attn_layers (List[int]): 
+                配置参数，同 __init__。
+            num_hidden_layers (int): 
+                配置参数，同 __init__。
+            num_wait_load_layers (int): 
+                配置参数，同 __init__。
+            real_offload (bool): 
+                配置参数，同 __init__。
+
+        Returns:
+            OmniKVMultiStageCache: 初始化并迁移数据后的新缓存对象。
+        """
         c = OmniKVMultiStageCache(
             full_attn_layers, num_hidden_layers, num_wait_load_layers, real_offload
         )
@@ -913,6 +1037,26 @@ class SinkCache(transformers.cache_utils.DynamicCache):
 
 
 def get_cache_cls(config):
+    """
+    根据配置获取相应的缓存类 (Cache Class)。
+
+    Args:
+        config (dict/object): 配置对象，需包含 'cache_cls' 键。
+            cache_cls 参数的可选值及其对应含义：
+            - "lazy" (OmniKVLazyCache):
+                类似于 eff，但采用惰性加载策略。仅当新计算的索引与当前 GPU 上的索引差异超过阈值 (skip_threshold) 时，才触发 CPU->GPU 的搬运，减少 PCIe 带宽占用。
+            - "default" (DynamicSubOffloadTrueCache): 
+                基础的卸载缓存。支持基于单一索引将特定层的 KV 缓存卸载到 CPU，并在 decoding 时根据索引搬回 GPU。适用于简单的 2-Stage 场景。
+            - "eff" (OmniKVMoreEffCache): 
+                更高效的实现，优化了内存布局或操作流程 (实现细节类似于 lazy 但没有阈值跳过机制)。
+            - "multi" (OmniKVMultiStageCache):
+                多阶段缓存 (Multi-Stage)。支持更精细的层级控制，将网络分为多个阶段 (Prefix, Select, Wait, Offload)，适用于复杂的 OmniKV 策略。
+            - "without_pack" (WOPackCache): 
+                功能与 multi 类似，但可能在显存管理上有所不同（如不进行某些 tensor pack 操作），默认启用 dense_more。
+
+    Returns:
+        class: 对应的缓存类（注意是类本身，不是实例）。
+    """
     name2cls = {
         "lazy": OmniKVLazyCache,
         "default": DynamicSubOffloadTrueCache,

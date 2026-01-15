@@ -1,6 +1,6 @@
 {
     // 用于 KV 缓存卸载（Offloading）时的 CPU 线程数，控制数据传输的并发度
-    "cpu_num_threads": 8,
+    "cpu_num_threads": 32,
 
     // 是否应用模型的对话模板（Chat Template）。通常在 CoT 或特定对话任务时开启
     "use_chat_template": false,
@@ -9,10 +9,10 @@
     "cot": false,
 
     // 允许的最大上下文 Token 长度，超过此长度会根据策略进行截断
-    "max_context_len": 128500,
+    "max_context_len": 32000,
 
     // 模型权重文件的本地路径或 HuggingFace ID
-    "model_name": "../models/Llama-3-8B-Instruct-262k",
+    "model_name": "/NV1/ykw/models/Llama-3-8B-Instruct-262k",
 
     // 是否启用 8-bit 权重量化（减少显存占用，但会有轻微精度损失）
     "load_in_8bit": false,

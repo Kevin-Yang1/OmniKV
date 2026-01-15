@@ -1,3 +1,39 @@
+"""
+文件名: infer.py
+模块名称: OmniKV 统一推理接口与模型工厂
+创建/维护者: OmniKV Team
+
+核心功能:
+    本文件是 OmniKV 项目的推理中枢，提供了一套高度抽象的 API 工厂模式 (`get_any_chat_api`)，
+    用于统一加载和运行多种架构的大语言模型。它是连接上层评估脚本 (benchmark) 与底层模型实现 (modeling) 的桥梁。
+    
+    主要职责包括：
+    1. 模型工厂 (Model Factory): 根据配置文件动态实例化标准 HF 模型、OmniKV 变体模型 (TokenLM, TokenOnceLM) 或基准模型 (H2O, InfLLM)。
+    2. 统一推理流 (Unified Inference Pipeline): 提供 `inference_bs1` 函数，标准化了 Prompt 模板处理、Tokenize、设备管理、生成调用及后处理流程。
+    3. 环境适配: 处理 Flash Attention 2 注入、4-bit/8-bit 量化配置 (BitsAndBytes) 以及 Tokenizer 的特殊标记 (Pad/EOS) 修正。
+
+主要依赖:
+    - External: 
+        - torch: 深度学习后端
+        - transformers: 模型加载与生成控制 (LlamaForCausalLM, AutoTokenizer)
+        - bitsandbytes: 显存优化量化支持
+    - Internal:
+        - modeling.*: 自定义的模型实现 (核心 OmniKV 逻辑位于 modeling/token_model.py 等)
+        - baselines.*: 对比算法适配器 (infllm, h2o)
+        - tiny_tools.*: 基础设施 (日志, 配置读取)
+
+逻辑流程:
+    1.入口调用: 外部脚本调用 `get_any_chat_api(config_path)`。
+    2.配置分发: 读取 JSON 配置，根据 `model_cls` 字段决定加载策略：
+       - "token" / "token_once": 进入 OmniKV 加载器 (`get_token_select_llama_chat_api...`)。
+       - "raw": 进入标准 Llama 加载器。
+       - "infllm" / "h2o": 进入基准算法加载器。
+    3.模型初始化: 
+       - 实例化对应的 `LM` 类 (如 `TokenLM`)。
+       - 配置 KV Cache 压缩参数 (`LlamaCompressorConfig`)。
+    4.闭包构建: 返回一个封装了 `model` 和 `tokenizer` 的 `chat` 函数。
+    5.运行时: `chat(prompt)` -> `inference_bs1` -> `model.generate()` -> `decode`。
+"""
 import os
 
 import torch
@@ -72,31 +108,67 @@ def inference_bs1(
     return_input_ids=False,
     **kwargs,
 ):
+    """
+    通用单批次(Batch Size=1)推理函数，封装了从文本到生成的全过程。
+
+    该函数处理 Prompt 的模板应用、Tokenize、设备转换、模型生成调用以及输出截取。
+    仅适用于 batch_size=1 的推理场景。
+
+    Args:
+        prompt (str): 原始用户输入的提示词文本。
+        tkn (transformers.PreTrainedTokenizer): 预训练分词器实例，用于编码输入。
+        model (torch.nn.Module): 已加载到设备上的语言模型实例。
+        generation_config (transformers.GenerationConfig, optional): 生成参数配置（如 temperature, max_new_tokens）。
+        use_chat_template (bool, optional): 是否使用分词器或自定义的 Chat 模板格式化 prompt。默认为 False。
+        model_name (str, optional): 模型名称，用于选择特定的 Chat 模板逻辑。当 use_chat_template=True 时必填。
+        use_fixed_prompt (bool, optional): 是否使用固定的系统提示词（已弃用标志，保留兼容性）。默认为 False。
+        use_cot (bool, optional): 是否启用思维链(CoT)模板。默认为 False。
+        return_input_ids (bool, optional): 若为 True，则仅返回编码后的 input_ids 张量而不进行生成。默认为 False。
+        **kwargs: 传递给 `model.generate()` 的其他关键字参数（如 max_new_tokens=200）。
+
+    Returns:
+        torch.Tensor | list:
+            - 默认返回生成部分的 Token IDs 张量（形状为 [1, new_tokens]），已切除输入部分。
+            - 如果 return_input_ids=True，则返回编码后的输入 Tensor（形状为 [1, seq_len]）。
+    """
     st = time.time()
-    with torch.no_grad():
-        with autocast():
+    with torch.no_grad():  # 禁用梯度计算，梯度计算在训练时使用
+        with autocast():   # 自动混合精度上下文管理器，提升推理速度和节省显存
+            # 1. 自动收集所有可能的停止符 (EOS Token)
             terminators = [] + [tkn.eos_token_id] if tkn.eos_token_id else []
+            # 兼容不同模型的特殊结束标记（如 Llama-3 的 <|eot_id|> 或 ChatML 的 <|im_end|>）
             for eos_token in ["<|eot_id|>", "<|endoftext|>", "<|im_end|>"]:
                 if eos_token in tkn.vocab:
                     terminators += [tkn.convert_tokens_to_ids(eos_token)]
+            
+            # 2. 应用对话模板（如果启用）
             if use_chat_template:
+                # 获取对应模型的对话 prompt 模板 (支持 CoT)
                 template = get_chat_template(model_name, use_cot)
+                # 填充用户输入和系统提示词
                 prompt = template.format(
                     user_message=prompt, system_prompt="You are a helpful assistant."
                 )
                 # logger.debug(f"prompt is {prompt}")
                 input_ids = tkn(prompt, return_tensors="pt")["input_ids"]
             else:
+                # 不使用模板，直接对原始文本进行编码
                 input_ids = tkn(prompt, return_tensors="pt")["input_ids"]
+                
+            # 3. 如果仅请求 input_ids（用于调试或长度计算），直接返回
             if return_input_ids:
                 return input_ids
-            n = input_ids.shape[1]
+                
+            # 4. 执行模型生成
+            n = input_ids.shape[1] # 记录输入序列的长度，用于后续切片
             temp = model.generate(
-                input_ids.cuda(model.device),
+                input_ids.cuda(model.device), # 确保输入在正确的设备上
                 generation_config=generation_config,
-                eos_token_id=terminators,
-                **kwargs,
-            )[:, n:]
+                eos_token_id=terminators, # 传入所有收集到的结束符
+                **kwargs, # 传递 max_new_tokens 等其他参数
+            )[:, n:] # [:, n:] 操作仅保留生成的 output 部分，去掉输入的 prompt
+            
+            # 5. 性能监控日志（可选）
             if os.environ.get("USE_TIMER", False):
                 print(f"-------inference_bs1 time {round(time.time() - st, 4)} s")
             return temp
@@ -214,8 +286,8 @@ def get_token_select_llama_chat_api_with_tokenizer_bs1(config_path):
 
     # 配置专属于 Token 选择模型的参数 (继承自 LlamaConfig)
     cfg_cls = TokenConfig
-    cfg = read_config(config_path)
-    config = cfg_cls.from_pretrained(model_name)
+    cfg = read_config(config_path)  # 读取 OmniKV 相关配置
+    config = cfg_cls.from_pretrained(model_name) # 从预训练模型加载基础配置
     config.set_config(**cfg)  # 设置OmniKV相关配置
 
     # 默认设备设置为 GPU 0

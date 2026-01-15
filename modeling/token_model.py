@@ -1,14 +1,24 @@
 """
 文件名: token_model.py
-描述: 基于 Token 动态选择策略的 Llama 模型实现（OmniKV 核心逻辑之一）。
-功能: 在推理（Decoding）阶段，根据当前 Query 对历史 Key 的注意力分数，动态选择最重要的若干个 Token 保存在缓存中，以实现 KV 缓存的压缩。
-主要流程:
-1. 在每一层 DecoderLayer 的 forward 中判断是否为 Decoding 阶段。
-2. 调用 select_tokens_by_attn 函数计算当前最重要的 Token 索引 (idx)。
-3. 将索引传递给 DynamicSubCache，使其在实际计算注意力时仅提取这些选中的 KV 对。
-4. 支持分析 Token 选择的一致性（IoU）和稀疏度。
-"""
+核心功能:
+    实现 OmniKV 的基础版动态 Token 选择模型 (`TokenLM`)。
+    该模型在推理 Decode 阶段，针对每一层计算 Attention Score，
+    只保留 Top-K 个最重要的 KV Cache，从而大幅降低显存占用。
+    适用于主要实验配置中的 `model_cls="token"`。
 
+依赖关系:
+    - transformers: LlamaForCausalLM, LlamaDecoderLayer
+    - modeling.spec_cache: DynamicSubCache (核心缓存结构)
+    - modeling.compressor: OmniKVCompressorConfig
+
+主要逻辑流程:
+    1. TokenLM 初始化时加载 TokenLayer 替代原生 DecoderLayer。
+    2. 在 TokenLayer.forward中：
+       - 判断是否处于 Decoding 阶段 (seq_len=1)。
+       - 若是，调用 `select_tokens_by_attn` 计算当前 Query 对历史 Key 的关注度。
+       - 获取 Top-K 索引，更新 `past_key_value` (DynamicSubCache) 的 `out_idx`。
+    3. Self-Attention 计算只使用被选中的 Token。
+"""
 import torch
 import time
 from transformers.models.llama.modeling_llama import *

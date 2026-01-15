@@ -11,7 +11,7 @@
     "use_flash_attn": true,
     "do_select_layers": "2,8,18",
     "num_wait_load_layers": 1,
-    "real_offload": false,
+    "real_offload": true,
     "dense_more": true,
     "num_of_selected_tokens": 0.067,
     "selector_cls": "last",

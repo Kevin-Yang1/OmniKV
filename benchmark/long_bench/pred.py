@@ -55,24 +55,32 @@ def build_chat(tokenizer, prompt, model_name):
         str: 构造完成的 prompt，以便直接送入模型。
     """
     if "chatglm3" in model_name:
+        # ChatGLM3 使用其分词器内置的 `build_chat_input` 方法
         prompt = tokenizer.build_chat_input(prompt)
     elif "chatglm" in model_name and "chatglm3" not in model_name:
+        # 旧版 ChatGLM (v1/v2) 使用 `build_prompt` 方法
         prompt = tokenizer.build_prompt(prompt)
     elif "longchat" in model_name or "vicuna" in model_name:
+        # Vicuna 和 LongChat 系列模型依赖 FastChat 库来管理对话历史格式
         from fastchat.model import get_conversation_template
         conv = get_conversation_template("vicuna")
+        # 添加用户输入
         conv.append_message(conv.roles[0], prompt)
+        # 添加助手（Assistant）的占位符，准备开始生成
         conv.append_message(conv.roles[1], None)
         prompt = conv.get_prompt()
     elif "llama2" in model_name or 'llama-2' in model_name.lower():
+        # Llama 2 Chat 模型使用 [INST] ... [/INST] 包裹用户指令
         prompt = f"[INST]{prompt}[/INST]"
     elif "xgen" in model_name:
+        # XGen 模型使用特定的 Header 和 ### Human / ### Prompt 结构
         header = (
             "A chat between a curious human and an artificial intelligence assistant. "
             "The assistant gives helpful, detailed, and polite answers to the human's questions.\n\n"
         )
         prompt = header + f" ### Human: {prompt}\n###"
     elif "internlm" in model_name:
+        # InternLM (书生·浦语) 使用 <|User|>...<eoh>\n<|Bot|>: 格式
         prompt = f"<|User|>:{prompt}<eoh>\n<|Bot|>:"
     return prompt
 
@@ -95,63 +103,83 @@ def post_process(response, model_name):
 
 def get_pred(rank, world_size, data, max_length, max_gen, prompt_format, dataset, device, model_name, model2path,
              out_path, args):
-    """
-    核心推理函数：执行数据集遍历、文本截断、模型生成并保存结果。
+    """遍历数据集、调用模型生成并把结果追加到输出文件。
 
     Args:
-        rank (int): 进程排名。
-        world_size (int): 进程总数。
-        data (List[dict]): 待推理的数据集列表。
-        max_length (int): 输入 Token 的最大长度限制。
-        max_gen (int): 生成结果的最大 Token 数量。
-        prompt_format (str): 用于填充数据的 Prompt 模板。
-        dataset (str): 数据集名称。
-        device (int): 默认 GPU 设备序号。
-        model_name (str): 模型名称。
-        model2path (dict): 模型名称到本地路径的映射。
-        out_path (str): 结果保存路径。
-        args (Namespace): 命令行参数对象。
+        rank (int): 进程编号（目前只会传入 0）。
+        world_size (int): 计划的进程数量，目前保留字段。
+        data (List[dict]): 从 JSONL 中加载的样本列表。
+        max_length (int): 限制 prompt 的最大 token 长度，过长则从两端截断。
+        max_gen (int): 生成 token 的上限。
+        prompt_format (str): 用于 format json_obj 的 prompt 模板。
+        dataset (str): 当前任务名，用于控制特殊逻辑。
+        device (torch.device): 模型落在的 GPU slot。
+        model_name (str): 当前模型的 key。
+        model2path (dict): name -> checkpoint 路径映射。
+        out_path (str): 预测结果 JSONL 保存路径。
+            # 超长 prompt 在两端截断，避免抛弃指令右侧或者尾部关键信息
+        args (Namespace): CLI 参数，用于加载 cfg 等。
+    Returns:
+        None: 直接将每个样本的 `pred` 追加到 `out_path`，不返回值。
     """
+    # 1. 初始化设置：固定随机种子以保证结果可复现，并读取 OmniKV 特有的 pipeline 配置
     seed_everything(42)
     d_cfg = read_config(args.cfg)
     device = 0
+            # 部分非对话任务更适合原始 prompt，避免双层 chat 模板干扰输出
+    # x = torch.rand(100_000, 100_000, device=0)
+    # device_num = torch.cuda.device_count()
+    # if d_cfg.get('use_multi_gpus', False):
+    #     device = rank % device_num
+    #     os.environ['CUDA_VISIBLE_DEVICES'] = str(device)
+    #     device = 0
+    #     assert torch.cuda.device_count() == 1
 
-    # 加载模型和分词器
+    # 2. 加载模型与分词器，支持自动判断模型架构（包括自定义的 OmniKV 模型）
     model, tokenizer, model_max_length = load_model_and_tokenizer(model2path[model_name], model_name, device, args.cfg)
+    
+    # 如果模型加载函数返回了特定的最大长度限制，则覆盖传入的参数
     if model_max_length is not None:
         max_length = model_max_length
         print(f"max_length is set to {max_length}")
 
-    # 遍历数据集进行预测
+    # 3. 核心循环，遍历数据集中的每个样本
     for json_obj in tqdm(data, desc=f'{dataset}'):
-        # 填充 prompt 模板
+        # 根据数据集提供的格式化字符串填充 Prompt
         prompt = prompt_format.format(**json_obj)
         
-        # 针对超长文本进行中间截断 (Middle-out truncation)
-        # 这种做法是为了同时保留开头（指令）和末尾（问题/最近信息），删掉中间的文档内容。
+        # 4. 超长 Prompt 截断策略
+        # 为了保留最重要的指令（通常在开头）和最新的上下文（通常在结尾），采用“中间截断”策略
+        # truncate to fit max_length (we suggest truncate in the middle,
+        # since the left and right side may contain crucial instructions)
         tokenized_prompt = tokenizer(prompt, truncation=False, return_tensors="pt").input_ids[0]
         if len(tokenized_prompt) > max_length:
             half = int(max_length / 2)
+            # 截取头尾各 half 长度的 Token，并重新解码回字符串拼接
             prompt = (tokenizer.decode(tokenized_prompt[:half], skip_special_tokens=True) +
                       tokenizer.decode(tokenized_prompt[-half:], skip_special_tokens=True))
 
-        # 构建对话模板 (Chat Template)
-        # 只有在特定的任务和模型下才包装对话指令格式
+        # 5. 应用对话模板（Prompt Engineering）
+        # 对于某些特定数据集（如代码补全、抽取任务），原始 Prompt 效果更好，因此跳过 Chat 模板
         if dataset not in ["trec", "triviaqa", "samsum", "lsht", "lcc",
-                           "repobench-p"]:
+                           "repobench-p"]:  # chat models are better off without build prompts on these tasks
             if 'my_model' not in model_name:
+                # 标准模型：使用通用的 chat 模板构建逻辑
                 prompt = build_chat(tokenizer, prompt, model_name)
             else:
+                # OmniKV 自定义模型：使用配置文件中指定的原始模型名来选择模板  这里并没有对 prompt 做任何修改
                 prompt = build_chat(tokenizer, prompt, d_cfg['model_name'])
 
-        # 准备模型输入
+        # 将处理好的 Prompt 编码为张量并移动到 GPU  truncate = False : 即使文本长度超过了模型的限制，分词器也会把所有的文本都转成 ID
         input = tokenizer(prompt, truncation=False, return_tensors="pt").to(device)
         context_length = input.input_ids.shape[-1]
         
-        # 执行推理生成
+        # 6. 执行推理生成
+        # SAMSUM 数据集包含对话摘要任务，需要特殊的停止条件以防止模型无限复读
         if dataset == "samsum":
-            # samsum 数据集需要特殊处理停止词（如换行符），防止生成冗余内容
+            # prevent illegal output on samsum (model endlessly repeat "\nDialogue"), might be a prompting issue
             if "my_model" not in model_name:
+                # 原生 HF 模型 generate 调用
                 output = model.generate(
                     **input,
                     max_new_tokens=max_gen,
@@ -159,9 +187,11 @@ def get_pred(rank, world_size, data, max_length, max_gen, prompt_format, dataset
                     do_sample=False,
                     temperature=1.0,
                     min_length=context_length + 1,
+                    # 额外增加换行符作为停止符，防止生成重复的 Dialogue header
                     eos_token_id=[tokenizer.eos_token_id, tokenizer.encode("\n", add_special_tokens=False)[-1]],
                 )[0]
             else:
+                # OmniKV 自定义模型调用接口 (callable 对象，非 generate 方法)
                 output = model(
                     prompt, generation_config=None,
                     max_new_tokens=max_gen,
@@ -173,7 +203,7 @@ def get_pred(rank, world_size, data, max_length, max_gen, prompt_format, dataset
                                   tokenizer.encode("\n", add_special_tokens=False)[-1]],
                     skip_special_tokens=True)
         else:
-            # 标准生成逻辑
+            # 常规数据集生成逻辑
             if "my_model" not in model_name:
                 output = model.generate(
                     **input,
@@ -183,7 +213,7 @@ def get_pred(rank, world_size, data, max_length, max_gen, prompt_format, dataset
                     temperature=1.0,
                 )[0]
             else:
-                # 调用 OmniKV 的全权生成接口
+                # OmniKV 调用
                 output = model(
                     prompt, generation_config=None,
                     max_new_tokens=max_gen,
@@ -193,25 +223,29 @@ def get_pred(rank, world_size, data, max_length, max_gen, prompt_format, dataset
                     skip_special_tokens=True
                 )
         
-        # 结果解码与后处理
+        # 7. 解码输出结果
+        # 如果 output 已经是字符串（某些 API 直接返回文本），则跳过解码
         if not isinstance(output, str):
-            # 将生成的 token id 会转为字符串
+            # 仅解码生成的新 Token 部分，跳过输入的 Prompt
             pred = tokenizer.decode(output[context_length:], skip_special_tokens=True)
         else:
             pred = output
 
+        # 后处理（去除特定的 Special Token 或 冗余文本）
         pred = post_process(pred, model_name)
         
-        # 将预测回答序列化并追加写入结果文件
+        # 8. 结果追加写入文件（JSONL 格式）
         with open(out_path, "a", encoding="utf-8") as f:
             json.dump({"pred": pred, "answers": json_obj["answers"], "all_classes": json_obj["all_classes"],
                        "length": json_obj["length"]}, f, ensure_ascii=False)
             f.write('\n')
 
-        # 诊断逻辑：如果设置了环境变量，则保存 Token 选择的索引并提前终止
+        # 9. 可选：Token 选择分析（用于调试 OmniKV 核心算法行为）
+        # 用来分析模型性质的code:::
         if os.environ.get('SAVE_SELECTED_IDX', False):
             idx_tracer.save_idx()
-            if idx_tracer.num_samples > 20: # 采样数限制
+            # 提前终止：仅运行少量样本用于验证
+            if idx_tracer.num_samples > 20:
                 return
 
 

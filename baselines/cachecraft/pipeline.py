@@ -23,10 +23,13 @@ class CacheCraftPipeline:
         self.tokenizer = AutoTokenizer.from_pretrained(model_name_or_path)
         
         print(f"Loading model from {model_name_or_path}...")
+        
+        # [Updated] Since we upgraded transformers, we can load natively.
         self.model = AutoModelForCausalLM.from_pretrained(
-            model_name_or_path, 
+            model_name_or_path,
             torch_dtype=torch.float16, 
-            device_map=device
+            device_map=device,
+            trust_remote_code=True # Add this for safety
         )
         self.model.eval()
         
@@ -40,263 +43,301 @@ class CacheCraftPipeline:
         return hashlib.md5(text.encode('utf-8')).hexdigest()
 
     @torch.no_grad()
-    def prefill_and_capture(self, chunks: List[str], question: str):
+    def generate(self, chunks: List[str], question: str, prompt_template: str = None):
         """
-        Offline/Online Profiling 阶段。
-        运行一次完整的 Forward，捕获每个 Chunk 的 KV Cache 和 Attention Profiling 数据。
+        统一的生成入口。
+        实现 RAG 混合流水线：
+        1. Parse Template & Prefix
+        2. Iterate Chunks:
+           - Check Cache
+           - If Hit: Load -> Apply RoPE -> Reuse (Placeholder for Recompute)
+           - If Miss: Run Model -> Capture -> Save -> Use
+        3. Generate Answer
         """
-        print("\n--- Starting Prefill & Capture ---")
+        print("\n--- Starting Cache-Craft Generation ---")
         
-        # 1. 构造 Prompt 并计算 Token 边界
-        input_text = ""
-        chunk_boundaries = []
-        current_token_offset = 0
+        # 获取模型层数
+        num_layers = self.model.config.num_hidden_layers
         
-        for chunk_text in chunks:
-            # 简单拼接，实际应用可能需要分隔符
-            input_text += chunk_text
+        # 维护每一层的 KV Cache 列表，用于最终拼接
+        # Structure: layer_caches[layer_idx] = list of (k_tensor, v_tensor)
+        layer_caches = [[] for _ in range(num_layers)] 
+        
+        current_seq_len = 0
+        current_prefix_hashes = []
+
+        # --- Phase 0: Template Parsing & Prefix Encoding ---
+        suffix_part = question # Default fallback
+        if prompt_template and "{context}" in prompt_template:
+            parts = prompt_template.split("{context}")
+            prefix_str = parts[0]
+            suffix_template = parts[1]
             
-            # 计算 token 数量 (简化版，实际中可能需要精确对齐)
-            # 注意：这种简单相加的方式在此时仅做演示，精确边界需要对 full_ids 进行映射
-            # 更好的做法是对每个 chunk 单独 tokenize 这里的 offset 计算仅供参考
-            # 实际操作：
-            chunk_tokens = self.tokenizer(chunk_text, add_special_tokens=False).input_ids
-            length = len(chunk_tokens)
-            
+            # Encode Prefix (Always Compute / Or we could cache prefix too, but assuming short)
+            if prefix_str:
+                print("Encoding Prefix instructions...")
+                prefix_inputs = self.tokenizer(prefix_str, return_tensors="pt").to(self.device)
+                # Run forward to get KV
+                prefix_outputs = self.model(prefix_inputs.input_ids, use_cache=True)
+                
+                # Extract KV
+                prefix_kv = prefix_outputs.past_key_values
+                self._append_kv_to_layer_caches(layer_caches, prefix_kv)
+                
+                current_seq_len += prefix_inputs.input_ids.shape[1]
+                print(f"Prefix encoded. Length: {current_seq_len}")
+
+            # Prepare Suffix Template
+            suffix_part = suffix_template.replace("{input}", question)
+        else:
+            print("No template used or invalid template format. Using question as suffix.")
+        
+        # --- Phase 1: Process Chunks (Hit or Miss) ---
+        for i, chunk_text in enumerate(chunks):
             c_hash = self._hash_chunk(chunk_text)
-            chunk_boundaries.append({
-                'hash': c_hash,
-                'start': current_token_offset,
-                'end': current_token_offset + length,
-                'text': chunk_text
-            })
-            current_token_offset += length
+            chunk_inputs = self.tokenizer(chunk_text, add_special_tokens=False, return_tensors="pt").to(self.device)
+            chunk_len = chunk_inputs.input_ids.shape[1]
             
-        # 加上 Question
-        input_text += question
+            # Check Store
+            chunk_data = self.store.get_chunk(c_hash)
+            
+            if chunk_data:
+                # === Cache Hit ===
+                print(f"Chunk {i} [Hit]: {c_hash[:8]} (Len: {chunk_len})")
+                
+                # [Placeholder] CFO & Recompute Decision
+                # recompute_indices = self.controller.get_recompute_tokens(...)
+                # For now, we skip recompute logic and fully reuse
+                
+                # Load & Apply RoPE (Stitching)
+                self._reuse_chunk_data(layer_caches, chunk_data, current_seq_len, num_layers)
+                
+            else:
+                # === Cache Miss ===
+                print(f"Chunk {i} [Miss]: {c_hash[:8]} (Len: {chunk_len}) -> Computing & Capturing")
+                
+                # 1. Construct current past_key_values from layer_caches
+                current_past = self._build_past_key_values(layer_caches)
+                
+                # 2. Setup Capture Context
+                # We want to capture the PRE-ROPE KV of this chunk
+                CURRENT_CONTEXT["mode"] = "capture"
+                CURRENT_CONTEXT["chunk_boundaries"] = [{
+                    'hash': c_hash,
+                    'start': 0, # Relative to the NEW input_ids
+                    'end': chunk_len,
+                    'text': chunk_text
+                }]
+                CURRENT_CONTEXT["captured_data"] = {} # Reset capture buffer (per layer)
+
+                # 3. Run Forward (Compute)
+                # Input: just the new chunk tokens
+                # Position IDs: need to align with current_seq_len
+                position_ids = torch.arange(
+                    current_seq_len, current_seq_len + chunk_len, device=self.device
+                ).unsqueeze(0)
+                
+                # Attention Mask Handling
+                # When passing past_key_values, HF expects attention_mask to cover both past and new tokens
+                # Shape should be [1, past_len + new_len]
+                past_len = current_past.get_seq_length() if current_past else 0
+                if not past_len and isinstance(current_past, tuple): # Fallback
+                     past_len = current_past[0][0].shape[-2]
+                     
+                attention_mask = torch.ones(
+                    (1, past_len + chunk_len), 
+                    dtype=torch.long, 
+                    device=self.device
+                )
+
+                outputs = self.model(
+                    input_ids=chunk_inputs.input_ids,
+                    past_key_values=current_past, 
+                    position_ids=position_ids,
+                    attention_mask=attention_mask, # ADDED THIS
+                    use_cache=True
+                )
+                
+                # 4. Save Captured Data (Pre-RoPE) to Store
+                self._save_captured_data_to_store(CURRENT_CONTEXT["captured_data"], CURRENT_CONTEXT["chunk_boundaries"])
+                
+                # 5. Update layer_caches with the NEW Post-RoPE KV returned by model
+                # Model returns full past_key_values (old + new) or incremental depending on implementation?
+                # Usually HF returns the updated full/incremental cache object.
+                # Since we passed `current_past`, the output `outputs.past_key_values` contains everything.
+                # BUT, to keep our `layer_caches` clean (list of chunks), we prefer to extract JUST the new part?
+                # Or easier: just perform the same extraction logic on the output KV, 
+                # taking the last `chunk_len` tokens.
+                
+                new_kv = outputs.past_key_values
+                self._append_kv_to_layer_caches(layer_caches, new_kv, take_last_tokens=chunk_len)
+
+                # Clean Context
+                CURRENT_CONTEXT["mode"] = "off"
+                CURRENT_CONTEXT["captured_data"] = {}
+                
+            # Advance Seq Len
+            current_seq_len += chunk_len
+            current_prefix_hashes.append(c_hash)
+
+        # --- Phase 2: Generate Answer ---
+        print("\nGenerating answer...")
+        q_inputs = self.tokenizer(suffix_part, return_tensors="pt").to(self.device)
         
-        # 2. 准备上下文
-        # 实际全量 Tokenize
-        inputs = self.tokenizer(input_text, return_tensors="pt").to(self.device)
-        input_ids = inputs.input_ids
+        # Build final complete cache
+        final_past = self._build_past_key_values(layer_caches)
         
-        # 校准边界 (因为 tokenizer merge 可能导致某些边界 token 合并，这里为了演示简化处理，假设边界是对齐的)
-        # 如果需要严格对齐，需要更复杂的逻辑。
+        # Generation Loop
+        generated_tokens = []
+        cache = final_past
         
-        # 设置全局 Context
-        CURRENT_CONTEXT["mode"] = "capture"
-        CURRENT_CONTEXT["chunk_boundaries"] = chunk_boundaries
-        CURRENT_CONTEXT["captured_data"] = {} # Clear previous data
+        past_len = current_seq_len # Should match cache length
+        q_len = q_inputs.input_ids.shape[1]
         
-        # 3. 运行 Model Forward
-        print(f"Forward pass with input length: {input_ids.shape[1]}")
-        self.model(input_ids)
+        position_ids = torch.arange(past_len, past_len + q_len, device=self.device).unsqueeze(0)
+        attention_mask = torch.ones((1, past_len + q_len), dtype=torch.long, device=self.device)
+
+        # First step (Question)
+        with torch.no_grad():
+            outputs = self.model(
+                input_ids=q_inputs.input_ids,
+                position_ids=position_ids,
+                past_key_values=cache,
+                attention_mask=attention_mask,
+                use_cache=True
+            )
         
-        # 4. 提取数据并保存
-        captured = CURRENT_CONTEXT["captured_data"]
+        next_token = torch.argmax(outputs.logits[:, -1, :], dim=-1).unsqueeze(1)
+        generated_tokens.append(next_token)
+        cache = outputs.past_key_values # Update cache
         
+        # Decode loop
+        for _ in range(50):
+             past_len = cache.get_seq_length() if hasattr(cache, 'get_seq_length') else (past_len + 1)
+             position_ids = torch.tensor([[past_len]], device=self.device)
+             
+             with torch.no_grad():
+                 outputs = self.model(
+                     input_ids=next_token,
+                     position_ids=position_ids,
+                     past_key_values=cache,
+                     use_cache=True
+                 )
+             
+             next_token = torch.argmax(outputs.logits[:, -1, :], dim=-1).unsqueeze(1)
+             if next_token.item() == self.tokenizer.eos_token_id:
+                 break
+             generated_tokens.append(next_token)
+             cache = outputs.past_key_values
+
+        final_ids = torch.cat(generated_tokens, dim=1)
+        result_text = self.tokenizer.decode(final_ids[0], skip_special_tokens=True)
+        print(f"Result: {result_text}")
+        return result_text
+
+    def _append_kv_to_layer_caches(self, layer_caches, kv_obj, take_last_tokens=None):
+        """Helper to unpack HF KV object and append to our layer_caches list"""
+        num_layers = len(layer_caches)
+        for i in range(num_layers):
+            if hasattr(kv_obj, "key_cache"): # DynamicCache
+                k = kv_obj.key_cache[i]
+                v = kv_obj.value_cache[i]
+            else: # Tuple
+                k, v = kv_obj[i]
+            
+            if take_last_tokens:
+                k = k[..., -take_last_tokens:, :]
+                v = v[..., -take_last_tokens:, :]
+            
+            layer_caches[i].append((k, v))
+
+    def _build_past_key_values(self, layer_caches):
+        """Helper to stitch layer_caches into a HF compatible cache object"""
+        final_past_key_values = []
+        for l_idx, layer_ops in enumerate(layer_caches):
+            ks = [op[0] for op in layer_ops]
+            vs = [op[1] for op in layer_ops]
+            if ks:
+                layer_k = torch.cat(ks, dim=2)
+                layer_v = torch.cat(vs, dim=2)
+                final_past_key_values.append((layer_k, layer_v))
+            else:
+                return None
+        
+        # Convert to DynamicCache
+        try:
+            from transformers import DynamicCache
+            cache_obj = DynamicCache()
+            cache_obj.key_cache = [item[0] for item in final_past_key_values]
+            cache_obj.value_cache = [item[1] for item in final_past_key_values]
+            if hasattr(cache_obj, "_seen_tokens"):
+                cache_obj._seen_tokens = cache_obj.key_cache[0].shape[-2]
+            return cache_obj
+        except ImportError:
+            return tuple(final_past_key_values)
+
+    def _save_captured_data_to_store(self, captured, chunk_boundaries):
+        """Helper to save captured data to storage"""
         for ch_info in chunk_boundaries:
             c_hash = ch_info['hash']
             c_text = ch_info['text']
             
-            # 收集该 Chunk 所有层的数据
             k_cache_list = []
             v_cache_list = []
             layer_scores_list = []
             inter_scores_list = []
             
-            # 遍历层 (根据 captured 中的 key)
             sorted_layers = sorted(captured.keys())
             for lay_idx in sorted_layers:
                 layer_data = captured[lay_idx].get(c_hash)
                 if layer_data:
                     k_cache_list.append(layer_data['k_cache'])
                     v_cache_list.append(layer_data['v_cache'])
-                    layer_scores_list.append(layer_data['layer_scores'])
-                    inter_scores_list.append(layer_data['inter_scores_tensor'])
-            
+                    # Default placeholders if missing (e.g. first layer might not have scores)
+                    if "layer_scores" in layer_data:
+                         layer_scores_list.append(layer_data['layer_scores'])
+                         inter_scores_list.append(layer_data['inter_scores_tensor'])
+                    else:
+                         # first layer or error, append dummy
+                         pass 
+
             if k_cache_list:
-                print(f"Saving chunk {c_hash[:8]}... (Layers: {len(k_cache_list)})")
+                print(f"  -> Saving to disk: {c_hash[:8]}")
+                # Note: Assuming scores are captured. If not (first token?), handle gracefully.
+                # For simplicity in this demo, we save what we have.
                 self.store.save_chunk(
-                    c_hash,
-                    k_cache_list,
-                    v_cache_list,
-                    layer_scores_list,
-                    inter_scores_list,
-                    c_text
+                    c_hash, k_cache_list, v_cache_list, 
+                    layer_scores_list, inter_scores_list, c_text
                 )
-            else:
-                print(f"Warning: No data captured for chunk {c_hash[:8]}")
 
-        # 清理 Context
-        CURRENT_CONTEXT["mode"] = "off"
-        CURRENT_CONTEXT["captured_data"] = {}
-        print("Capture complete.")
+    def _reuse_chunk_data(self, layer_caches, chunk_data, current_seq_len, num_layers):
+        """Helper to process Cache Hit: Load from store, Apply RoPE, Append"""
+        chunk_len = chunk_data['k_cache'][0].shape[2]
+        
+        # Position Range for RoPE
+        chunk_positions = torch.arange(
+            current_seq_len, current_seq_len + chunk_len, device=self.device
+        ).unsqueeze(0)
 
-    @torch.no_grad()
-    def inference_with_cache(self, new_chunks: List[str], question: str):
-        """
-        在线推理阶段。
-        利用 Cache-Craft 逻辑：检查 Cache -> 计算 CFO -> 决策 -> 拼装 Cache。
-        """
-        print("\n--- Starting Inference with Cache ---")
-        
-        # 模拟生成 Past Key Values
-        # List of tuple(key, value) for each layer
-        past_key_values = [] 
-        
-        # 获取模型层数
-        num_layers = self.model.config.num_hidden_layers
-        num_heads = self.model.config.num_attention_heads
-        head_dim = self.model.config.hidden_size // num_heads
-        
-        # 用于构建 layer-wise 的 cache 列表
-        # structure: [[k_l0, v_l0], [k_l1, v_l1], ...] (will convert to tuple later)
-        layer_caches = [[] for _ in range(num_layers)] 
-        
-        current_prefix_hashes = []
-        current_seq_len = 0
-        
-        # 1. 遍历 New Chunks (RAG Retrieved Results)
-        for chunk_text in new_chunks:
-            c_hash = self._hash_chunk(chunk_text)
+        for layer_idx in range(num_layers):
+            # No-RoPE KV from Store
+            k_no_rope = chunk_data['k_cache'][layer_idx].to(self.device).to(torch.float16)
+            v_state = chunk_data['v_cache'][layer_idx].to(self.device).to(torch.float16)
             
-            # --- Cache Hit Check ---
-            chunk_data = self.store.get_chunk(c_hash)
+            # Apply RoPE
+            layer_module = self.model.model.layers[layer_idx].self_attn
+            cos, sin = layer_module.rotary_emb(v_state, chunk_positions)
+            k_roped = (k_no_rope * cos) + (self._rotate_half(k_no_rope) * sin)
             
-            if chunk_data:
-                # Cache Hit!
-                print(f"Cache Hit: {c_hash[:8]}")
-                
-                # --- Decision Making ---
-                # 计算 CCI
-                layer_scores = chunk_data['layer_scores']
-                cci = self.controller.calculate_cci(layer_scores)
-                
-                # 计算 Beta' (Overlap)
-                # 简化逻辑：这里假设 old_prefix 就是该 chunk 存储时记录的前缀
-                # 但我们在 storage 里没存 old_prefix (论文里建议存)。
-                # 作为 Baseline 简化：假设 old_prefix 为空或者我们只做增量判断
-                # 暂时用一个 dummy old_prefix 来模拟 beta calculation (e.g., 假设上次是在同样位置)
-                # 实际实现应在 save_chunk 时保存 prefix_hashes
-                beta_prime = 1.0 # 假设上下文完全匹配以跳过重算，或者设为0.5测试
-                
-                # 计算 CFO & Recompute Tokens
-                chunk_len = chunk_data['k_cache'][0].shape[2] # [BS, Head, Seq, Dim]
-                inter_scores = chunk_data['inter_scores_tensor']
-                
-                recompute_indices = self.controller.get_recompute_tokens(
-                    chunk_len, cci, beta_prime, inter_scores
-                )
-                
-                print(f"  CCI: {cci:.4f}, Beta': {beta_prime:.2f}")
-                print(f"  Decision: Recompute {len(recompute_indices)} / {chunk_len} tokens")
-                
-                # --- Cache Stitching (No-RoPE -> RoPE) ---
-                # 我们需要把 No-RoPE 的 Key 拿出来，根据当前的新位置 (current_seq_len) 施加 RoPE
-                
-                for layer_idx in range(num_layers):
-                    # 获取 No-RoPE Key 和 Value (CPU -> GPU)
-                    k_no_rope = chunk_data['k_cache'][layer_idx].to(self.device).to(torch.float16)
-                    v_state = chunk_data['v_cache'][layer_idx].to(self.device).to(torch.float16)
-                    
-                    # 准备 RoPE
-                    # 我们需要为这部分 cache 生成 position_ids
-                    # Range: [current_seq_len, current_seq_len + chunk_len)
-                    chunk_positions = torch.arange(
-                        current_seq_len, 
-                        current_seq_len + chunk_len, 
-                        device=self.device
-                    ).unsqueeze(0) # [1, Chunk_Len]
-                    
-                    # 获取该层的 Attention Module 以调用 rotary_emb
-                    # 假设 model.layers 是 iterable
-                    layer_module = self.model.model.layers[layer_idx].self_attn
-                    
-                    # 生成 cos, sin
-                    # rotary_emb 需要输入 value_states 来推断 dtype 和 device，seq_len 是总长
-                    # 这里 seq_len 参数通常用于切片 cache，我们传 max_len 或者当前需要的长度
-                    cos, sin = layer_module.rotary_emb(v_state, seq_len=current_seq_len + chunk_len)
-                    
-                    # 应用 RoPE
-                    # query 传 None? No, apply_rotary_pos_emb expects query and key.
-                    # 我们只想旋转 Key。我们可以传一个 dummy query 或者只计算 Key 部分的逻辑。
-                    # transformers 的 apply_rotary_pos_emb 同时处理 q, k。
-                    # 如果我们只处理 k，可以构造一个 dummy q。
-                    dummy_q = torch.empty(1, 1, chunk_len, head_dim, device=self.device)
-                    
-                    # 注意：apply_rotary_pos_emb 实现可能依赖 slicing。
-                    # 调用 transformers 的 def apply_rotary_pos_emb(q, k, cos, sin, position_ids)
-                    # cos, sin 应该是对应位置的。
-                    # 标准实现里 cos, sin 是全量的 [Max_Len, Dim]。apply 内部会根据 position_ids 索引吗？
-                    # LlamaRotaryEmbedding 的 forward 返回的 cos, sin 是切好或者 cache 好的。
-                    # 在 LlamaAttention.forward 里: cos, sin = self.rotary_emb(value_states, seq_len=kv_seq_len)
-                    # 这里的 seq_len 决定了返回多长的 cos/sin。
-                    # 我们需要的是对应 [current_seq_len : current_seq_len+chunk_len] 这段的 cos/sin。
-                    
-                    # 修正 RoPE 逻辑：
-                    # 1. 获取全量 cos, sin 直到当前末尾
-                    full_cos, full_sin = layer_module.rotary_emb(v_state, seq_len=current_seq_len + chunk_len)
-                    # 2. 我们只需要当前 chunk 对应的 cos/sin
-                    # cos shape: [1, 1, Seq_Len, Dim]
-                    chunk_cos = full_cos[:, :, current_seq_len : current_seq_len + chunk_len, :]
-                    chunk_sin = full_sin[:, :, current_seq_len : current_seq_len + chunk_len, :]
-                    
-                    # 3. 对 k_no_rope 应用旋转
-                    # 手动实现旋转 (参考 apply_rotary_pos_emb 源码，避免 dummy q 的麻烦)
-                    # output = (k * cos) + (rotate_half(k) * sin)
-                    from transformers.models.llama.modeling_llama import rotate_half
-                    k_roped = (k_no_rope * chunk_cos) + (rotate_half(k_no_rope) * chunk_sin)
-                    
-                    # 将处理好的 KV 加入当前层的列表
-                    # 稍后拼接
-                    layer_caches[layer_idx].append((k_roped, v_state))
-                    
-                current_seq_len += chunk_len
-                current_prefix_hashes.append(c_hash)
-            else:
-                print(f"Cache Miss: {c_hash[:8]}")
-                # 真实场景需要运行模型计算该 chunk 的 KV
-                # 这里作为 Baseline 代码生成，暂时跳过或者报错
-                raise NotImplementedError("Online calculation for cache miss not implemented in this demo.")
+            layer_caches[layer_idx].append((k_roped, v_state))
 
-        # 2. 组装最终的 past_key_values
-        final_past_key_values = []
-        for l_idx in range(num_layers):
-            # layer_caches[l_idx] is list of (k, v) tuples
-            # Concat them along seq_len dimension (dim 2)
-            ks = [item[0] for item in layer_caches[l_idx]]
-            vs = [item[1] for item in layer_caches[l_idx]]
-            
-            if ks:
-                layer_k = torch.cat(ks, dim=2)
-                layer_v = torch.cat(vs, dim=2)
-                final_past_key_values.append((layer_k, layer_v))
-            else:
-                # No cache (only question?)
-                final_past_key_values = None
-                break
-                
-        # 3. 处理 Question 并生成
-        print("Generating answer...")
-        q_inputs = self.tokenizer(question, return_tensors="pt").to(self.device)
-        
-        # 此时的 position_ids 需要接在 current_seq_len 之后
-        q_len = q_inputs.input_ids.shape[1]
-        
-        # 运行生成
-        # 传递 past_key_values
-        # 注意：transformers 的 generate 会自动处理 position_ids 如果有了 past
-        outputs = self.model.generate(
-            input_ids=q_inputs.input_ids,
-            past_key_values=final_past_key_values, # 传入我们精心拼接的 Cache
-            max_new_tokens=50,
-            do_sample=False
-        )
-        
-        result_text = self.tokenizer.decode(outputs[0], skip_special_tokens=True)
-        print(f"Result: {result_text}")
-        return result_text
+
+
+    def _rotate_half(self, x):
+        """Rotates half the hidden dims of the input."""
+        x1 = x[..., : x.shape[-1] // 2]
+        x2 = x[..., x.shape[-1] // 2 :]
+        return torch.cat((-x2, x1), dim=-1)
 
 if __name__ == "__main__":
     # 简单的测试桩

@@ -75,6 +75,7 @@ cached_files/
 
 # 数据集
 benchmark/long_bench/data
+datasets/
 
 # 输出
 pred

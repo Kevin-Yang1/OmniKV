@@ -18,14 +18,17 @@ def cache_craft_forward(
     hidden_states: torch.Tensor,
     attention_mask: Optional[torch.Tensor] = None,
     position_ids: Optional[torch.LongTensor] = None,
-    past_key_values: Optional[Any] = None,
+    past_key_value: Optional[Any] = None,
     output_attentions: bool = False,
     use_cache: bool = False,
+    cache_position: Optional[torch.LongTensor] = None,
+    position_embeddings: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
     **kwargs,
 ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Tuple[torch.Tensor]]]:
     """
     Monkey Patch 版本的 LlamaAttention.forward。
     支持 Cache-Craft 的 capture 逻辑。
+    Updated for Transformers 4.45 compatibility.
     """
     bsz, q_len, _ = hidden_states.size()
 
@@ -52,6 +55,49 @@ def cache_craft_forward(
     query_states = query_states.view(bsz, q_len, self.num_heads, self.head_dim).transpose(1, 2)
     key_states = key_states.view(bsz, q_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
     value_states = value_states.view(bsz, q_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
+
+    # ================= Cache-Craft Reuse Logic (Pre-RoPE injection) =================
+    # 如果处于 reuse 模式，我们需要将从存储中检索到的 Pre-RoPE KV 注入到当前流中
+    # 这一步必须在 RoPE 之前做，以便统一应用正确的位置编码
+    if CURRENT_CONTEXT["mode"] == "reuse":
+        layer_idx = self.layer_idx
+        # 检查当前层是否有需要复用的数据
+        reuse_payload = CURRENT_CONTEXT.get("reuse_payload", {})
+        if layer_idx in reuse_payload and reuse_payload[layer_idx]:
+            # payload 应该是一个 list of (k_chunk, v_chunk)
+            # 我们将它们拼接起来
+            retrieved_k_list = [item[0].to(key_states.device) for item in reuse_payload[layer_idx]]
+            retrieved_v_list = [item[1].to(value_states.device) for item in reuse_payload[layer_idx]]
+            
+            # 将 Retrieval 部分拼接在当前计算的 KV 之前
+            # 注意：这里假设 reused chunks 确实是当前内容的前缀 (Prefix)
+            # key_states: (Batch, Num_KV_Heads, Seq_Len_Total, Head_Dim)
+            key_states = torch.cat(retrieved_k_list + [key_states], dim=2)
+            value_states = torch.cat(retrieved_v_list + [value_states], dim=2)
+            
+            # [重要] 位置编码调整
+            # 我们现在的 key_states 变长了，包含了历史。
+            # 如果传入的 position_ids 只是针对当前新 token 的（例如 [100, 101]），
+            # 那么我们需要扩展 position_ids 以覆盖前面的 retrieved tokens (例如 [0...99, 100, 101])。
+            # 通常 Llama 的 RoPE 实现会根据 KV 长度和 position_ids 配合。
+            # 这里我们需要确保 position_ids 正确对齐。
+            if position_ids is not None:
+                # 计算 retrieved 部分的总长度
+                prefix_len = sum(k.shape[2] for k in retrieved_k_list)
+                
+                # 构造前缀的 position_ids
+                # 假设 retrieved 是从 0 开始连续的（通常如此）
+                # position_ids: (Batch, Seq_Len_New) -> 我们需要 (Batch, Seq_Len_Old + Seq_Len_New)
+                # 注意：这只是一个简单的假设，复杂的非连续 Reuse 可能需要更复杂的 Position ID 管理
+                start_pos = position_ids[0, 0].item() - prefix_len
+                # 防御性检查：
+                start_pos = max(0, int(start_pos)) 
+                
+                prefix_pos_ids = torch.arange(start_pos, start_pos + prefix_len, device=position_ids.device).unsqueeze(0)
+                if position_ids.shape[0] > 1:
+                     prefix_pos_ids = prefix_pos_ids.expand(position_ids.shape[0], -1)
+                
+                position_ids = torch.cat([prefix_pos_ids, position_ids], dim=1)
 
     # ================= Cache-Craft Capture Logic Part 1: Save Raw KV =================
     # 在应用 RoPE 之前，立即保存 Pre-RoPE Keys 和 Pre-Repeat Values
@@ -88,8 +134,8 @@ def cache_craft_forward(
     # 获取当前输入的序列长度（即本次 Forward 的 Key 数量）
     kv_seq_len = key_states.shape[-2]
     
-    # 如果存在 KV Cache（past_key_values），说明这是解码（Decoding）阶段或长序列分段处理
-    if past_key_values is not None:
+    # 如果存在 KV Cache（past_key_value），说明这是解码（Decoding）阶段或长序列分段处理
+    if past_key_value is not None:
         # cache 更新依赖 layer_idx，必须确保它存在
         if self.layer_idx is None:
             raise ValueError("Layer index is needed for cache update")
@@ -98,18 +144,19 @@ def cache_craft_forward(
         # get_usable_length 会根据 Cache 实现（如 Window Attention）返回有效的历史长度
         # 最终 kv_seq_len 表示：[历史 KV 长度] + [当前 KV 长度]
         # 这个总长度将用于生成正确的位置索引（Position IDs）和正弦/余弦嵌入（Cos/Sin）
-        if hasattr(past_key_values, "get_usable_length"):
-            kv_seq_len += past_key_values.get_usable_length(kv_seq_len, self.layer_idx)
+        if hasattr(past_key_value, "get_usable_length"):
+            kv_seq_len += past_key_value.get_usable_length(kv_seq_len, self.layer_idx)
         else:
             # Fallback for older transformers or simple tuple caches
-            if isinstance(past_key_values, tuple):
-                 kv_seq_len += past_key_values[self.layer_idx][0].shape[-2]
+            if isinstance(past_key_value, tuple):
+                 kv_seq_len += past_key_value[self.layer_idx][0].shape[-2]
             else:
                  # Default behavior for Cache objects without explicit usable length method (unlikely in new versions)
-                 kv_seq_len += past_key_values.get_seq_length(self.layer_idx)
+                 kv_seq_len += past_key_value.get_seq_length(self.layer_idx)
     
     # 2. RoPE
-    cos, sin = self.rotary_emb(value_states, seq_len=kv_seq_len)
+    # Transformers 4.41+ LlamaRotaryEmbedding.forward(x, position_ids)
+    cos, sin = self.rotary_emb(value_states, position_ids)
     
     # 注意：past_key_values 处理逻辑略过，假设 capture 模式是在 Prefill 阶段运行（无 past），
     # 或者我们只关注当前的 fresh tokens。如果是有 past_key_values 的情况（Decode），通常不会触发 Capture 整块。
@@ -117,8 +164,8 @@ def cache_craft_forward(
     
     query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin, position_ids)
 
-    if past_key_values is not None:
-        key_states, value_states = past_key_values.update(key_states, value_states, self.layer_idx, cache_kwargs=kwargs)
+    if past_key_value is not None:
+        key_states, value_states = past_key_value.update(key_states, value_states, self.layer_idx, cache_kwargs=kwargs)
 
     # 3. Repeat KV for GQA
     # [GQA 处理] 如果是 Grouped Query Attention，复制 KV 头以匹配 Query 头数
@@ -213,7 +260,7 @@ def cache_craft_forward(
     if not output_attentions:
         attn_weights = None
 
-    return attn_output, attn_weights, past_key_values
+    return attn_output, attn_weights, past_key_value
 
 def apply_monkey_patch(model):
     """
@@ -223,7 +270,13 @@ def apply_monkey_patch(model):
     print("Applying Cache-Craft Monkey Patch...")
     count = 0
     for name, module in model.named_modules():
-        if "LlamaAttention" in module.__class__.__name__:
+        # 支持 LlamaAttention, LlamaFlashAttention2, LlamaSdpaAttention 等变体
+        class_name = module.__class__.__name__
+        if "Llama" in class_name and "Attention" in class_name:
+            # 排除 CrossAttention (如果存在)
+            if "Cross" in class_name:
+                continue
+
             # 绑定方法到实例
             import types
             module.forward = types.MethodType(cache_craft_forward, module)

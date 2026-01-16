@@ -1,0 +1,28 @@
+[
+    {
+        "_id": "dummy_1",
+        "answer": "The Oberoi family",
+        "question": "Which family owns the hotel chains where The Oberoi Udaivilas is located?",
+        "context": [
+            [
+                "The Oberoi Udaivilas",
+                [
+                    "The Oberoi Udaivilas is a luxury hotel located in Udaipur, Rajasthan, India. "
+                ]
+            ],
+            [
+                "Oberoi Hotels & Resorts",
+                [
+                    "Oberoi Hotels & Resorts is a luxury hotel chain with head office in Delhi. ",
+                    "It is owned by the Oberoi family."
+                ]
+            ],
+            [
+                "Irrelevant Doc 1",
+                [
+                    "This is just some random text to fill up the context window slightly."
+                ]
+            ]
+        ]
+    }
+]

@@ -1,3 +1,5 @@
+# CUDA_VISIBLE_DEVICES=1 PYTHONPATH=. python baselines/cachecraft/run_hotpotqa.py --num_samples 10 --output_file /NV1/ykw/projects/OmniKV/baselines/cachecraft/output/craft_results.txt
+
 import json
 import argparse
 import os
@@ -10,10 +12,12 @@ def parse_args():
     """
     parser = argparse.ArgumentParser(description="在 HotpotQA 数据集上运行 Cache-Craft 基准测试")
     parser.add_argument("--data_path", type=str, default="datasets/hotpotqa/hotpot_dev_distractor_v1.json", help="数据集路径 (JSON格式)")
-    parser.add_argument("--model_path", type=str, default="meta-llama/Llama-2-7b-chat-hf", help="HuggingFace 模型路径或名称")
+    parser.add_argument("--model_path", type=str, default="/NV1/ykw/models/Meta-Llama-3.1-8B-Instruct", help="HuggingFace 模型路径或名称")
     parser.add_argument("--num_samples", type=int, default=1, help="运行测试的样本数量 (用于快速调试)")
     parser.add_argument("--alpha", type=float, default=1.0, help="CFO (Context-Aware Fractional Offloading) 算法的 alpha 参数")
     parser.add_argument("--device", type=str, default="cuda", help="使用的计算设备 (如 cuda, cpu)")
+    parser.add_argument("--disable_caching", action="store_true", help="禁用 KV 缓存功能 (MetadataStore)")
+    parser.add_argument("--output_file", type=str, default=None, help="输出文件路径")
     return parser.parse_args()
 
 def load_data(path, num_samples):
@@ -63,7 +67,8 @@ def main():
     pipeline = CacheCraftPipeline(
         model_name_or_path=args.model_path,
         alpha=args.alpha,
-        device=args.device
+        device=args.device,
+        enable_caching=not args.disable_caching
     )
     
     # 加载测试数据
@@ -91,6 +96,13 @@ def main():
         
         print(f"\nSample {i+1} Prediction: {pred_answer}")
         print(f"{'='*50}")
+
+        if args.output_file:
+            with open(args.output_file, "a") as f:
+                f.write(f"==================== Processing Sample {i+1}/{len(samples)} ====================\n")
+                f.write(f"Question: {question}\n")
+                f.write(f"Golden Answer: {sample['answer']}\n")
+                f.write(f"Generating Answer: {pred_answer.strip()}\n\n")
 
 if __name__ == "__main__":
     main()

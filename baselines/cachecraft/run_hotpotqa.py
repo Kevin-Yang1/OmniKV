@@ -76,7 +76,7 @@ def main():
     
     # 逐个样本处理
     for i, sample in enumerate(samples):
-        print(f"\n{'='*20} Processing Sample {i+1}/{len(samples)} {'='*20}")
+        print(f"\n{'='*30} Processing Sample {i+1}/{len(samples)} {'='*30}")
         question = sample['question']
         print(f"Question: {question}")
         print(f"Golden Answer: {sample['answer']}")
@@ -95,7 +95,7 @@ def main():
         pred_answer = pipeline.generate(chunks, question=question, prompt_template=prompt_template)
         
         print(f"\nSample {i+1} Prediction: {pred_answer}")
-        print(f"{'='*50}")
+        print(f"{'='*70}")
 
         if args.output_file:
             with open(args.output_file, "a") as f:

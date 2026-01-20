@@ -24,6 +24,19 @@ class CacheCraftPipeline:
         self.enable_caching = enable_caching
         self.tokenizer = AutoTokenizer.from_pretrained(model_name_or_path)
         
+        # [Fix] Reset Chat Template to remove date injection logic alignment
+        # Added explicit bos_token logic since we are overriding the template
+        self.tokenizer.chat_template = (
+            "{{ bos_token }}"
+            "{% for message in messages %}"
+            "<|start_header_id|>{{ message['role'] }}<|end_header_id|>\n\n"
+            "{{ message['content'] }}<|eot_id|>"
+            "{% endfor %}"
+            "{% if add_generation_prompt %}"
+            "<|start_header_id|>assistant<|end_header_id|>\n\n"
+            "{% endif %}"
+        )
+        
         print(f"Loading model from {model_name_or_path}...")
         
         # [Updated] Since we upgraded transformers, we can load natively.
@@ -91,10 +104,14 @@ class CacheCraftPipeline:
         context_placeholder = "___CONTEXT_PLACEHOLDER___"
         
         # 1. 构造 User Content
+        # [Fix] 强制在 placeholder 后加一个空格，防止 Tokenizer 将 Chunk 结尾和 Suffix 开头合并 (如 \n\n)
+        # 这对于保持 Cache 也就是 Split Tokenization 与 Global Tokenization 一致至关重要
+        safe_placeholder = context_placeholder + " "
+        
         if prompt_template and "{context}" in prompt_template:
-            user_content = prompt_template.replace("{context}", context_placeholder).replace("{input}", question)
+            user_content = prompt_template.replace("{context}", safe_placeholder).replace("{input}", question)
         else:
-            user_content = f"Answer the question based on the context.\n\nContext:\n{context_placeholder}\n\nQuestion: {question}"
+            user_content = f"Answer the question based on the context.\n\nContext:\n{safe_placeholder}\n\nQuestion: {question}"
 
         # 2. 应用 Chat Template (如果可用)
         if hasattr(self.tokenizer, "apply_chat_template") and self.tokenizer.chat_template:
@@ -112,10 +129,14 @@ class CacheCraftPipeline:
             full_prompt_str = user_content
 
         # 3. 分割前缀和后缀
+        # 注意: apply_chat_template 可能会保留我们在 user_content 里加的空格
+        # 分割时我们使用原始的 context_placeholder (不带空格) 进行 locate
+        # 这样 parts[1] (Suffix) 的开头将会包含那个 safe_placeholder 里的空格
         if context_placeholder in full_prompt_str:
             parts = full_prompt_str.split(context_placeholder)
             prefix_str = parts[0]
-            suffix_part = parts[1]
+            # parts[1] starts with " " because we used safe_placeholder above
+            suffix_part = parts[1] 
         else:
             prefix_str = ""
             suffix_part = full_prompt_str
@@ -126,36 +147,36 @@ class CacheCraftPipeline:
             print("Merging Prefix into Chunks stream...")
             chunks.insert(0, prefix_str)
             
-        # === DEBUG: Tokenization Consistency Check ===
-        # full_text_joined = "".join(chunks) + suffix_part
-        # # 模拟真实的 attention_mask/special tokens 行为，这里尽量用最裸的逻辑
-        # full_tokens = self.tokenizer(full_text_joined, add_special_tokens=False).input_ids
+        # === DEBUG: 分词一致性检查 ===
+        full_text_joined = "".join(chunks) + suffix_part
+        # 模拟真实的 attention_mask/special tokens 行为，这里尽量用最裸的逻辑
+        full_tokens = self.tokenizer(full_text_joined, add_special_tokens=False).input_ids
         
-        # split_tokens_concat = []
-        # for ch in chunks:
-        #     split_tokens_concat.extend(self.tokenizer(ch, add_special_tokens=False).input_ids)
-        # # Suffix is also tokenized separately in the pipeline
-        # split_tokens_concat.extend(self.tokenizer(suffix_part, add_special_tokens=False).input_ids)
+        split_tokens_concat = []
+        for ch in chunks:
+            split_tokens_concat.extend(self.tokenizer(ch, add_special_tokens=False).input_ids)
+        # Suffix is also tokenized separately in the pipeline
+        split_tokens_concat.extend(self.tokenizer(suffix_part, add_special_tokens=False).input_ids)
         
-        # if split_tokens_concat != full_tokens:
-        #     print(f"\n[CRITICAL WARNING] Tokenization Mismatch Detected!")
-        #     print(f"Full Text Token Len: {len(full_tokens)}")
-        #     print(f"Split & Concat Len:  {len(split_tokens_concat)}")
+        if split_tokens_concat != full_tokens:
+            print(f"\n[CRITICAL WARNING] Tokenization Mismatch Detected!")
+            print(f"Full Text Token Len: {len(full_tokens)}")
+            print(f"Split & Concat Len:  {len(split_tokens_concat)}")
             
-        #     min_len = min(len(full_tokens), len(split_tokens_concat))
-        #     diff_idx = -1
-        #     for i in range(min_len):
-        #         if full_tokens[i] != split_tokens_concat[i]:
-        #             diff_idx = i
-        #             break
+            min_len = min(len(full_tokens), len(split_tokens_concat))
+            diff_idx = -1
+            for i in range(min_len):
+                if full_tokens[i] != split_tokens_concat[i]:
+                    diff_idx = i
+                    break
             
-        #     if diff_idx != -1:
-        #         print(f"First mismatch at index {diff_idx}:")
-        #         print(f"  Native: {full_tokens[diff_idx:diff_idx+5]}")
-        #         print(f"  Split:  {split_tokens_concat[diff_idx:diff_idx+5]}")
-        #         print(f"  Context text near mismatch: {repr(self.tokenizer.decode(full_tokens[max(0, diff_idx-2):diff_idx+2]))}")
-        # else:
-        #     print(f"\n[SUCCESS] Tokenization is consistent (Len: {len(full_tokens)}).")
+            if diff_idx != -1:
+                print(f"First mismatch at index {diff_idx}:")
+                print(f"  Native: {full_tokens[diff_idx:diff_idx+5]}")
+                print(f"  Split:  {split_tokens_concat[diff_idx:diff_idx+5]}")
+                print(f"  Context text near mismatch: {repr(self.tokenizer.decode(full_tokens[max(0, diff_idx-2):diff_idx+2]))}")
+        else:
+            print(f"\n[SUCCESS] Tokenization is consistent (Len: {len(full_tokens)}).")
         # ===============================================
         
         # --- Phase 1: 处理文档块 (命中或未命中通过 Batching 处理) ---

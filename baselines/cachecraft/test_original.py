@@ -65,6 +65,21 @@ def main():
     # 3. 加载模型
     print(f"Loading native model from {args.model_path}...")
     tokenizer = AutoTokenizer.from_pretrained(args.model_path)
+    
+    # [Fix] Reset Chat Template to remove date injection logic
+    # This ensures deterministic behavior across dates and environments
+    # Added explicit bos_token logic
+    tokenizer.chat_template = (
+        "{{ bos_token }}"
+        "{% for message in messages %}"
+        "<|start_header_id|>{{ message['role'] }}<|end_header_id|>\n\n"
+        "{{ message['content'] }}<|eot_id|>"
+        "{% endfor %}"
+        "{% if add_generation_prompt %}"
+        "<|start_header_id|>assistant<|end_header_id|>\n\n"
+        "{% endif %}"
+    )
+    
     if tokenizer.pad_token_id is None and tokenizer.eos_token_id is not None:
         tokenizer.pad_token_id = tokenizer.eos_token_id
     model = AutoModelForCausalLM.from_pretrained(
@@ -91,7 +106,9 @@ def main():
         full_context = "".join(chunks_text)
         
         # 构造 Prompt
-        full_prompt = prompt_template.replace("{context}", full_context).replace("{input}", question)
+        # [Fix] 强制在 Context 和 Question 之间加一个空格 (align with Pipeline fix)
+        # 这对于 Llama 3 的 Tokenizer 边界行为非常敏感
+        full_prompt = prompt_template.replace("{context}", full_context + " ").replace("{input}", question)
 
         # 使用聊天模板以匹配 Llama-3.1-Instruct 的预期输入格式
         messages = [
@@ -118,8 +135,8 @@ def main():
             )
             # Last token's last hidden state
             final_hidden_state = debug_outputs.hidden_states[-1][0, -1, :] 
-            print(f"[DEBUG Original] Final Token Hidden State - Mean: {final_hidden_state.mean().item():.8f}, Sum: {final_hidden_state.sum().item():.8f}")
-            print(f"[DEBUG Original] First 5 Logits: {debug_outputs.logits[0, -1, :5].tolist()}")
+            print(f"[DEBUG Original] 最终 Prompt Hidden State - Mean: {final_hidden_state.mean().item():.8f}")
+            print(f"[DEBUG Original] 前 5 个 Logits: {debug_outputs.logits[0, -1, :5].tolist()}")
         # -------------------------------------
 
         # print("Generating (Greedy, max_new_tokens=50)...")

@@ -135,7 +135,7 @@ def main():
             )
             # Last token's last hidden state
             final_hidden_state = debug_outputs.hidden_states[-1][0, -1, :] 
-            print(f"[DEBUG Original] 最终 Prompt Hidden State - Mean: {final_hidden_state.mean().item():.8f}")
+            print(f"[DEBUG Original] 最终 Prompt Hidden State - Mean: {final_hidden_state.mean().item():.8f}, Sum: {final_hidden_state.sum().item():.8f}")
             print(f"[DEBUG Original] 前 5 个 Logits: {debug_outputs.logits[0, -1, :5].tolist()}")
         # -------------------------------------
 

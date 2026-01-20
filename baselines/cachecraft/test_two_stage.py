@@ -127,7 +127,7 @@ def main():
         
         # --- 调试：检查第一阶段结束状态 ---
         final_hidden_state_s1 = outputs1.hidden_states[-1][0, -1, :]
-        print(f"[DEBUG Two-Stage] 第一阶段结束 Hidden State - Mean: {final_hidden_state_s1.mean().item():.8f}")
+        print(f"[DEBUG Two-Stage] 第一阶段结束 Hidden State - Mean: {final_hidden_state_s1.mean().item():.8f}, Sum: {final_hidden_state_s1.sum().item():.8f}")
 
         # --- 执行第二阶段：问题 Prefill ---
         # 对第二阶段分词
@@ -154,7 +154,7 @@ def main():
 
         # --- 调试：检查第二阶段结束状态 (准备生成) ---
         final_hidden_state_s2 = outputs2.hidden_states[-1][0, -1, :]
-        print(f"[DEBUG Two-Stage] 最终 Prompt Hidden State - Mean: {final_hidden_state_s2.mean().item():.8f}")
+        print(f"[DEBUG Two-Stage] 最终 Prompt Hidden State - Mean: {final_hidden_state_s2.mean().item():.8f}, Sum: {final_hidden_state_s2.sum().item():.8f}")
         print(f"[DEBUG Two-Stage] 前 5 个 Logits: {outputs2.logits[0, -1, :5].tolist()}")
 
         # --- 执行第三阶段：解码 (Decoding) ---

@@ -283,8 +283,13 @@ class CacheCraftPipeline:
                     past_key_values=current_past, 
                     position_ids=position_ids,
                     attention_mask=attention_mask,
-                    use_cache=True
+                    use_cache=True,
+                    # --- DEBUG: Strict Numerical Check ---
+                    output_hidden_states=True
                 )
+                # --- DEBUG: Strict Numerical Check ---
+                final_hidden_state_s1 = outputs.hidden_states[-1][0, -1, :]
+                print(f"[DEBUG Pipeline] Batch Miss Final Token Hidden State - Mean: {final_hidden_state_s1.mean().item():.8f}, Sum: {final_hidden_state_s1.sum().item():.8f}")
                 
                 # 6. 保存捕获的数据 (内部迭代保存每个块)
                 self._save_captured_data_to_store(CURRENT_CONTEXT["captured_data"], CURRENT_CONTEXT["chunk_boundaries"])

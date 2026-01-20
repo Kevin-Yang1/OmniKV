@@ -179,12 +179,29 @@ def cache_craft_forward(
     # attn_weights 形状为 [Batch, Heads, Query_Len, Key_Len]
     attn_weights = torch.matmul(query_states, key_states.transpose(2, 3)) / math.sqrt(self.head_dim)
 
-    # [应用掩码] 加上一般是负无穷大的 mask，使 padding 或 future tokens 的 softmax 概率趋近于 0
+    # [应用掩码] 构造并应用因果 mask（与 HF 行为一致），再叠加 padding mask
+    # 说明：无论 attention_mask 是否提供，都必须保证 causal mask 生效
+    min_val = torch.finfo(attn_weights.dtype).min
+
+    if position_ids is not None:
+        q_pos = position_ids
+    else:
+        # 回退：假设 Query 位置是当前窗口的最后 q_len 个 token
+        q_pos = torch.arange(kv_seq_len - q_len, kv_seq_len, device=attn_weights.device).unsqueeze(0)
+        if bsz > 1:
+            q_pos = q_pos.expand(bsz, -1)
+
+    key_pos = torch.arange(kv_seq_len, device=attn_weights.device)
+    causal_mask = (q_pos.unsqueeze(-1) >= key_pos.view(1, 1, -1)).to(attn_weights.dtype)
+    attn_weights = attn_weights + (1.0 - causal_mask) * min_val
+
+    # padding mask: 支持 2D (bsz, kv_len) 或 4D additive mask
     if attention_mask is not None:
-        if attention_mask.size() != (bsz, 1, q_len, kv_seq_len):
+        if attention_mask.dim() == 2:
+            padding_mask = (1.0 - attention_mask[:, None, None, :].to(attn_weights.dtype)) * min_val
+            attn_weights = attn_weights + padding_mask
+        elif attention_mask.dim() == 4:
             attn_weights = attn_weights + attention_mask
-        else:
-             attn_weights = attn_weights + attention_mask
 
     # [Softmax 归一化] 计算注意力概率，upcast 到 fp32 以保证数值稳定性
     attn_weights = nn.functional.softmax(attn_weights, dim=-1, dtype=torch.float32).to(query_states.dtype)

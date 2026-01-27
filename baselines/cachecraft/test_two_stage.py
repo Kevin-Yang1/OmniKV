@@ -1,4 +1,4 @@
-# CUDA_VISIBLE_DEVICES=1 python baselines/cachecraft/test_two_stage.py --num_samples 10 --output_file /NV1/ykw/projects/OmniKV/baselines/cachecraft/output/two_stage_results.txt
+# CUDA_VISIBLE_DEVICES=1 python baselines/cachecraft/test_two_stage.py --num_samples 10 --output_file /NV1/ykw/projects/OmniKV/baselines/cachecraft/output/hotpot_dense_remix_v1/two_stage_results.txt
 
 import torch
 import argparse

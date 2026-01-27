@@ -1,4 +1,4 @@
-# CUDA_VISIBLE_DEVICES=1 python baselines/cachecraft/test_original.py --num_samples 10 --output_file /NV1/ykw/projects/OmniKV/baselines/cachecraft/output/orig_results.txt
+# CUDA_VISIBLE_DEVICES=1 python baselines/cachecraft/test_original.py --output_file /NV1/ykw/projects/OmniKV/baselines/cachecraft/output/hotpot_dense_remix_v1/orig_results.txt
 
 
 import torch
@@ -23,8 +23,8 @@ def format_context_chunk(context_item):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--model_path", type=str, default="/NV1/ykw/models/Meta-Llama-3.1-8B-Instruct", help="Path to the model")
-    parser.add_argument("--data_path", type=str, default="datasets/hotpotqa/hotpot_dev_distractor_v1.json", help="Data path")
-    parser.add_argument("--num_samples", type=int, default=1, help="Number of samples to run")
+    parser.add_argument("--data_path", type=str, default="datasets/2WikiMultihopQA_format/2WiKiMQA_dense_remix_v1.json", help="Data path")
+    parser.add_argument("--num_samples", type=int, default=None, help="Number of samples to run")
     parser.add_argument("--device", type=str, default="cuda")
     parser.add_argument("--output_file", type=str, default=None, help="Path to output file")
     args = parser.parse_args()

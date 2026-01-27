@@ -89,7 +89,7 @@ def compute_final_cci(layer_scores: List[Tuple[float, float]], epsilon: float = 
         epsilon (float): 防止除零异常的小量。
         
     Returns:
-        float: 计算得到的 CCI 分数。
+        float: 计算得到的 CCI 分数。[0.5, 1.0] 范围内，值越大表示该块越依赖上下文。
     """
     if not layer_scores:
         return 0.0

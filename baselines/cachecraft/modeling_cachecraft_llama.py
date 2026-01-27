@@ -210,6 +210,23 @@ def cache_craft_forward(
     if CURRENT_CONTEXT["mode"] == "capture":
         layer_idx = self.layer_idx
         chunk_info_list = CURRENT_CONTEXT.get("chunk_boundaries", [])
+        history_prefix_meta = CURRENT_CONTEXT.get("history_prefix_meta", [])
+        past_len_ctx = CURRENT_CONTEXT.get("past_len", None)
+        if past_len_ctx is None:
+            past_len_ctx = kv_seq_len - q_len
+        past_len_ctx = max(0, int(past_len_ctx))
+
+        # 预计算历史前缀范围（全历史）
+        history_prefix_ranges = []
+        history_prefix_hashes = []
+        running = 0
+        for meta in history_prefix_meta:
+            length = int(meta.get("len", 0) or 0)
+            if length <= 0:
+                continue
+            history_prefix_ranges.append((running, running + length))
+            history_prefix_hashes.append(meta.get("hash"))
+            running += length
         
         # 遍历所有定义的 Chunk 计算分数
         for i, chunk_info in enumerate(chunk_info_list):
@@ -220,11 +237,23 @@ def cache_craft_forward(
             if start >= q_len: continue
             real_end = min(end, q_len)
             
-            # 准备计算分数所需的前缀列表
-            prefix_ranges = [(c['start'], c['end']) for c in chunk_info_list[:i]]
+            # 准备计算分数所需的前缀列表（历史前缀 + 当前批次内更早块）
+            batch_prefix_ranges = [(c['start'], c['end']) for c in chunk_info_list[:i]]
+            prefix_ranges = history_prefix_ranges + [
+                (past_len_ctx + s, past_len_ctx + e) for (s, e) in batch_prefix_ranges
+            ]
+            prefix_hashes = history_prefix_hashes + [c['hash'] for c in chunk_info_list[:i]]
             
-            # 2. 计算 CCI 相关的 (a_l, b_l)
+            # 2. 计算 CCI 相关的 (a_l, b_l) (块间，块内)
             a_l, b_l = utils.compute_layer_scores(attn_weights, start, real_end, prefix_ranges)
+
+            # 2.1 计算每个前缀块的 inter(C_i, C_j) 分数
+            prefix_inter_scores = []
+            if prefix_ranges:
+                avg_attn = attn_weights[0].mean(dim=0).float()
+                for (prev_start, prev_end) in prefix_ranges:
+                    inter_block = avg_attn[start:real_end, prev_start:prev_end]
+                    prefix_inter_scores.append(inter_block.sum().item())
             
             # 3. 计算 Inter-Attention Tensor
             # TODO: 这里去掉注意力汇点是不是更好？
@@ -247,8 +276,9 @@ def cache_craft_forward(
             # 4. 补充填入分数信息
             # 注意：k/v cache 已经在 Part 1 填入
             if c_hash in CURRENT_CONTEXT["captured_data"][layer_idx]:
-                 CURRENT_CONTEXT["captured_data"][layer_idx][c_hash]["layer_scores"] = (a_l, b_l)
-                 CURRENT_CONTEXT["captured_data"][layer_idx][c_hash]["inter_scores_tensor"] = inter_scores_tensor
+                CURRENT_CONTEXT["captured_data"][layer_idx][c_hash]["layer_scores"] = (a_l, b_l)
+                CURRENT_CONTEXT["captured_data"][layer_idx][c_hash]["inter_scores_tensor"] = inter_scores_tensor
+                CURRENT_CONTEXT["captured_data"][layer_idx][c_hash]["prefix_inter_scores"] = prefix_inter_scores
     # ========================================================================
 
     # [注意力聚合] 使用 value_states 进行计算

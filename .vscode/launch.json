@@ -1,0 +1,120 @@
+{
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "name": "Debug Original Script TwoStage(HotpotQA)",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${workspaceFolder}/baselines/cachecraft/test_two_stage.py",
+            "console": "integratedTerminal",
+            "cwd": "${workspaceFolder}",
+            "env": {
+                "PYTHONPATH": "${workspaceFolder}",
+                "CUDA_VISIBLE_DEVICES": "1"
+            },
+            "args": [
+                "--model_path",
+                "/NV1/ykw/models/Meta-Llama-3.1-8B-Instruct",
+                "--data_path",
+                "datasets/hotpotqa/hotpot_dev_distractor_v1.json",
+                "--num_samples",
+                "10"
+            ],
+            "justMyCode": false
+        },
+        {
+            "name": "Debug Original Script (HotpotQA)",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${workspaceFolder}/baselines/cachecraft/test_original.py",
+            "console": "integratedTerminal",
+            "cwd": "${workspaceFolder}",
+            "env": {
+                "PYTHONPATH": "${workspaceFolder}",
+                "CUDA_VISIBLE_DEVICES": "1"
+            },
+            "args": [
+                "--model_path",
+                "/NV1/ykw/models/Meta-Llama-3.1-8B-Instruct",
+                "--data_path",
+                "datasets/hotpotqa/hotpot_dev_distractor_v1.json",
+                "--num_samples",
+                "10"
+            ],
+            "justMyCode": false
+        },
+        /*
+         CUDA_VISIBLE_DEVICES=1 PYTHONPATH=. python /NV1/ykw/projects/OmniKV/baselines/cachecraft/run_hotpotqa.py \
+        --model_path /NV1/ykw/models/Meta-Llama-3.1-8B-Instruct \
+        --data_path datasets/hotpotqa/hotpot_dev_distractor_v1.json \
+        --num_samples 1
+        */
+        {
+            "name": "Debug CacheCraft HotpotQA",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${workspaceFolder}/baselines/cachecraft/run_hotpotqa.py",
+            "console": "integratedTerminal",
+            "cwd": "${workspaceFolder}",
+            "env": {
+                "PYTHONPATH": "${workspaceFolder}",
+                "CUDA_VISIBLE_DEVICES": "1"
+            },
+            "args": [
+                "--model_path",
+                "/NV1/ykw/models/Meta-Llama-3.1-8B-Instruct",
+                "--data_path",
+                "datasets/hotpot_dense_remix_v1.json",
+                "--disable_recompute"
+                // "--num_samples",
+                // "10"
+            ],
+            "justMyCode": false
+        },
+        {
+            "name": "Debug CacheCraft LongBench",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${workspaceFolder}/baselines/cachecraft/run_longbench.py",
+            "console": "integratedTerminal",
+            "cwd": "${workspaceFolder}",
+            "env": {
+                "PYTHONPATH": "${workspaceFolder}",
+                "CUDA_VISIBLE_DEVICES": "0"
+            },
+            "args": [
+                "--model_path",
+                "/NV1/ykw/models/Meta-Llama-3.1-8B-Instruct",
+                "--data_path",
+                "/NV1/ykw/projects/OmniKV/datasets/longbench/2wikimqa_e_dense_remix_v1.json",
+                "--alpha",
+                "1.0",
+                "--shuffle_chunks",
+            ],
+            "justMyCode": false
+        },
+        {
+            "name": "Debug pred.py (LongBench)",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${workspaceFolder}/benchmark/long_bench/pred.py",
+            "console": "integratedTerminal",
+            "cwd": "${workspaceFolder}",
+            "env": {
+                "PYTHONPATH": "${workspaceFolder}",
+                "CUDA_VISIBLE_DEVICES": "1"
+            },
+            "args": [
+                "--model",
+                "my_model",
+                "--cfg",
+                "configs/example.json",
+                "--ws",
+                "1",
+                "--task",
+                "narrativeqa"
+            ],
+            "justMyCode": false
+        }
+    ]
+}

@@ -243,6 +243,7 @@ class CacheCraftPipeline:
         idx = 0
         total_hit_tokens = 0
         total_recomputed_tokens = 0
+        chunk_details = []
 
         while idx < len(chunks):
             chunk_text = chunks[idx]
@@ -256,9 +257,15 @@ class CacheCraftPipeline:
             if chunk_data:
                 # === Case A: 缓存命中 (Cache Hit) ===
                 chunk_len = chunk_data['k_cache'][0].shape[2]
-                print(f"Chunk {idx} [Hit]: {c_hash[:8]} (Len: {chunk_len})")
+                print(f"Chunk {idx} [Hit]: {chunk_data['text'][:10]} (Len: {chunk_len})")
                 
                 total_hit_tokens += chunk_len
+
+                # Variables for logging
+                log_cci = "N/A"
+                log_beta = "N/A"
+                log_recompute_ratio = 0.0
+                log_indices = []
 
                 # 若前缀不完全一致，按 CFO 选择部分 token 进行重算
                 old_prefix_hashes = chunk_data.get("prefix_hashes", [])
@@ -270,10 +277,17 @@ class CacheCraftPipeline:
                 if self.enable_recompute:
                     recompute_indices = []
                     if layer_scores and inter_scores:
-                        cci = self.controller.calculate_cci(layer_scores)
+                        # [Optimization] Use pre-calculated CCI if available
+                        if "cci" in chunk_data and chunk_data["cci"] is not None:
+                             cci = chunk_data["cci"]
+                        else:
+                             cci = self.controller.calculate_cci(layer_scores)
+                        
+                        log_cci = f"{cci:.4f}"
                         beta_prime = self.controller.calculate_beta_prime(
                             c_hash, old_prefix_hashes, new_prefix_hashes, prefix_inter_scores
                         )
+                        log_beta = f"{beta_prime:.4f}"
                         recompute_indices = self.controller.get_recompute_tokens(
                             chunk_len, cci, beta_prime, inter_scores,
                             fixed_ratio=self.fixed_recompute_ratio
@@ -282,6 +296,8 @@ class CacheCraftPipeline:
                     if recompute_indices:
                         num_recomputed = len(recompute_indices)
                         total_recomputed_tokens += num_recomputed
+                        log_recompute_ratio = num_recomputed / chunk_len
+                        log_indices = recompute_indices
                         print(f"  -> Recomputing {num_recomputed}/{chunk_len} tokens ({num_recomputed/chunk_len*100:.2f}%)")
 
                         self._recompute_chunk_kv(
@@ -292,6 +308,15 @@ class CacheCraftPipeline:
                             current_seq_len,
                             chunk_data
                         )
+                
+                # Record detailed stats
+                chunk_details.append({
+                    "chunk_idx": idx,
+                    "cci": log_cci,
+                    "beta_prime": log_beta,
+                    "recompute_ratio": f"{log_recompute_ratio*100:.2f}%",
+                    "recomputed_tokens": log_indices
+                })
                 
                 # === DEBUG: KV Deviation Analysis (vs Ground Truth) ===
                 if self.ground_truth_store:
@@ -335,7 +360,7 @@ class CacheCraftPipeline:
                     # [Memory Protection] 如果批次过大，强制截断，分批处理
                     # 1536 tokens 约为 1.5K，这是一个保守值，用于防止 OOM
                     # 注意：如果单个 chunk 本身就超过这个值，至少要处理一个
-                    MAX_BATCH_TOKEN_LIMIT = 1536 
+                    MAX_BATCH_TOKEN_LIMIT = 1536
                     if batch_total_len > 0 and (batch_total_len + miss_len) > MAX_BATCH_TOKEN_LIMIT:
                         print(f"[Memory Guard] Stopping batch at {batch_total_len} tokens (Next chunk {miss_len} too large)")
                         break
@@ -560,8 +585,9 @@ class CacheCraftPipeline:
         print(f"Result: {result_text}")
         
         # 整理调试输出
+        deviation_analysis_str = ""
         if hasattr(self, "_temp_deviation_logs") and self._temp_deviation_logs:
-            attn_analysis_log += "\n[KV Deviation Analysis]\n" + "\n".join(self._temp_deviation_logs)
+            deviation_analysis_str = "\n[KV Deviation Analysis]\n" + "\n".join(self._temp_deviation_logs)
             self._temp_deviation_logs = []  # Clear for next sample
         
         recompute_stats_str = "N/A"
@@ -573,6 +599,8 @@ class CacheCraftPipeline:
             "hidden_state": hs_info,
             "logits": logits_info,
             "attn_analysis": attn_analysis_log,
+            "deviation_analysis": deviation_analysis_str,
+            "chunk_details": chunk_details,
             "recompute_stats": recompute_stats_str
         }
         return result_text, debug_output
@@ -680,9 +708,16 @@ class CacheCraftPipeline:
 
             if k_cache_list:
                 # print(f"  -> Saving to disk: {c_hash[:8]}")
+                
+                # [Optimization] Pre-calculate CCI and store it
+                cci = None
+                if layer_scores_list:
+                    cci = self.controller.calculate_cci(layer_scores_list)
+
                 self.store.save_chunk(
                     c_hash, k_cache_list, v_cache_list, 
-                    layer_scores_list, inter_scores_list, c_text, prefix_hashes, prefix_inter_scores_list
+                    layer_scores_list, inter_scores_list, c_text, prefix_hashes, prefix_inter_scores_list,
+                    cci=cci
                 )
 
     def _recompute_chunk_kv(

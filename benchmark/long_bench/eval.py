@@ -141,11 +141,28 @@ def scorer(dataset, predictions, answers, all_classes):
 if __name__ == '__main__':
     args = parse_args()
     scores = dict()
+    
+    # [MODIFIED] 支持从 cachecraft 输出目录读取预测文件
+    # 优先检查 cachecraft 输出目录，如果不存在则回退到标准目录
+    cachecraft_pred_path = "baselines/cachecraft/output/longbench_eval"
+    
     # 根据是否是 LongBench-E 选择预测结果的路径
     if args.e:
-        path = f"benchmark/long_bench/pred_e/{args.model}/{args.cfg}"
+        standard_path = f"benchmark/long_bench/pred_e/{args.model}/{args.cfg}"
     else:
-        path = f"benchmark/long_bench/pred/{args.model}/{args.cfg}"
+        standard_path = f"benchmark/long_bench/pred/{args.model}/{args.cfg}"
+    
+    # 如果指定了 cachecraft 模型，优先使用 cachecraft 输出目录
+    if args.model == "cachecraft" and os.path.exists(cachecraft_pred_path):
+        path = cachecraft_pred_path
+        print(f"Using CacheCraft prediction path: {path}")
+    elif os.path.exists(standard_path):
+        path = standard_path
+        print(f"Using standard prediction path: {path}")
+    else:
+        # 回退到标准路径（即使不存在，后续会报错）
+        path = standard_path
+        print(f"Warning: Path may not exist: {path}")
     
     # 获取目录下所有预测文件
     all_files = os.listdir(path)
@@ -156,7 +173,26 @@ if __name__ == '__main__':
         if not filename.endswith("jsonl"):
             continue
         predictions, answers, lengths = [], [], []
-        dataset = filename.split('.')[0]
+        
+        # [MODIFIED] 数据集名称提取逻辑
+        # 去除 .jsonl 后缀
+        dataset_full = filename.split('.')[0]
+        
+        # 仅去除模式后缀（_nocache, _norecompute, _recompute 等），保留变体后缀
+        dataset = dataset_full
+        mode_suffixes = ['_nocache', '_norecompute', '_recompute']
+        
+        # 支持固定比例的后缀，如 _recompute_ratio_0.3
+        if '_recompute_ratio_' in dataset_full:
+            dataset = dataset_full.split('_recompute_ratio_')[0]
+        else:
+            for suffix in mode_suffixes:
+                if dataset_full.endswith(suffix):
+                    dataset = dataset_full[:-len(suffix)]
+                    break
+        
+        print(f"Processing file: {filename} -> dataset: {dataset}")
+        
         # 读取 jsonl 文件
         with open(f"{path}/{filename}", "r", encoding="utf-8") as f:
             for line in f:
@@ -168,22 +204,57 @@ if __name__ == '__main__':
                     lengths.append(data["length"])
         # 计算得分
         try:
-            if args.e:
-                score = scorer_e(dataset, predictions, answers, lengths, all_classes)
+            # [MODIFIED] 保留完整数据集名称，仅在查找评分函数时匹配
+            # 首先尝试直接查找
+            if dataset in dataset2metric:
+                metric_func = dataset2metric[dataset]
             else:
-                score = scorer(dataset, predictions, answers, all_classes)
-            scores[dataset] = score
-        except:
-            print(f"error in {dataset}")
+                # 如果找不到，尝试前缀匹配找到对应的基础数据集评分函数
+                metric_func = None
+                matched_base = None
+                for base_dataset in dataset2metric.keys():
+                    if dataset.startswith(base_dataset):
+                        # 检查后缀是否符合常见模式（以 _ 开头）
+                        suffix = dataset[len(base_dataset):]
+                        if suffix == '' or suffix.startswith('_'):
+                            metric_func = dataset2metric[base_dataset]
+                            matched_base = base_dataset
+                            print(f"  Using metric from '{matched_base}' for variant '{dataset}'")
+                            break
+                
+                if metric_func is None:
+                    raise ValueError(f"No matching metric function found for '{dataset}'")
+            
+            # 计算得分，结果中使用完整的数据集名称
+            if args.e:
+                score = scorer_e(matched_base or dataset, predictions, answers, lengths, all_classes)
+            else:
+                score = scorer(matched_base or dataset, predictions, answers, all_classes)
+            scores[dataset] = score  # 使用完整名称作为 key
+        except Exception as e:
+            print(f"error in {dataset}: {e}")
             pass
 
-    # 构造结果输出路径
-    if args.e:
-        out_path = f"benchmark/long_bench/pred_e/{args.model}/{args.cfg}/result.json"
+    # [MODIFIED] 构造结果输出路径
+    # 如果是 cachecraft 模型，输出到专门的评测结果目录
+    if args.model == "cachecraft":
+        eval_results_dir = "baselines/cachecraft/output/longbench_eval/eval_results"
+        os.makedirs(eval_results_dir, exist_ok=True)
+        
+        # 使用 cfg 作为文件名的一部分
+        result_filename = f"{args.cfg}_result.json" if args.cfg else "result.json"
+        out_path = os.path.join(eval_results_dir, result_filename)
+        print(f"Saving results to CacheCraft output directory: {out_path}")
     else:
-        out_path = f"benchmark/long_bench/pred/{args.model}/{args.cfg}/result.json"
+        # 其他模型使用标准输出路径
+        if args.e:
+            out_path = f"benchmark/long_bench/pred_e/{args.model}/{args.cfg}/result.json"
+        else:
+            out_path = f"benchmark/long_bench/pred/{args.model}/{args.cfg}/result.json"
     
     # 打印并写入结果
+    print("\nEvaluation Scores:")
     print(scores)
+    print(f"\nResults saved to: {out_path}")
     with open(out_path, "w") as f:
         json.dump(scores, f, ensure_ascii=False, indent=4)

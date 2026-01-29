@@ -9,8 +9,9 @@ from baselines.cachecraft import utils
 # 全局上下文，用于在 Monkey Patch 的 Forward 中传递信息
 CURRENT_CONTEXT: Dict[str, Any] = {
     "mode": "off",  # "capture", "reuse", "off"
-    "chunk_boundaries": [],  # List of dict: [{'start': start, 'end': end, 'hash': hash}, ...]
+    "chunk_boundaries": [],  # List of dict: [{'hash': 04220b, 'start': start, 'end': end, 'text': text, 'prefix_hash': [hash0, hash1, ...]}, ...]
     "captured_data": {},  # layer_idx -> {chunk_hash -> {k:..., v:..., scores:...}}
+    "past_len": None,  # past length 信息
 }
 
 def cache_craft_forward(
@@ -245,7 +246,7 @@ def cache_craft_forward(
             prefix_hashes = history_prefix_hashes + [c['hash'] for c in chunk_info_list[:i]]
             
             # 2. 计算 CCI 相关的 (a_l, b_l) (块间，块内)
-            a_l, b_l = utils.compute_layer_scores(attn_weights, start, real_end, prefix_ranges)
+            a_l, b_l = utils.compute_layer_scores(attn_weights, start, real_end, prefix_ranges, past_len_ctx)
 
             # 2.1 计算每个前缀块的 inter(C_i, C_j) 分数
             prefix_inter_scores = []
@@ -255,12 +256,20 @@ def cache_craft_forward(
                     inter_block = avg_attn[start:real_end, prev_start:prev_end]
                     prefix_inter_scores.append(inter_block.sum().item())
             
-            # 3. 计算 Inter-Attention Tensor
+            # 3. 计算 Inter-Attention Tensor, 块中每个 Token 对前文的注意力依赖度
             # TODO: 这里去掉注意力汇点是不是更好？
             # 计算当前 Chunk 中每个 Token 对前文（External Context）的总注意力权重
-            if start > 0:
+            # 我们想知道当前 Chunk 中的 token (Range: start ~ real_end) 对 "前面所有内容" 的注意力总和
+            # Key 的绝对坐标：
+            #   0 ~ past_len_ctx : 历史 KV
+            #   past_len_ctx ~ (past_len_ctx + start) : Batch 内部的前序 Chunk
+            # 所以总的前缀结束点是: past_len_ctx + start
+
+            total_prefix_end = past_len_ctx + start
+
+            if total_prefix_end > 0:
                 # inter_attn_slice: (Batch, Num_Heads, Chunk_Len, Prefix_Len)
-                inter_attn_slice = attn_weights[:, :, start:real_end, 0:start] 
+                inter_attn_slice = attn_weights[:, :, start:real_end, 0:total_prefix_end] 
                 
                 # 对最后一个维度（Key/Context）求和，得到每个 Token 对外部的总关注度
                 # inter_sum: (Batch, Num_Heads, Chunk_Len)
@@ -276,8 +285,22 @@ def cache_craft_forward(
             # 4. 补充填入分数信息
             # 注意：k/v cache 已经在 Part 1 填入
             if c_hash in CURRENT_CONTEXT["captured_data"][layer_idx]:
+                # layer_scores = (a_l, b_l):
+                #   a_l: Inter-Chunk Attention Score (本块对所有前序历史的总关注度) -> 用于计算 CCI (a / (a+b))
+                #   b_l: Intra-Chunk Attention Score (本块对自身的总关注度)
                 CURRENT_CONTEXT["captured_data"][layer_idx][c_hash]["layer_scores"] = (a_l, b_l)
+
+                # inter_scores_tensor:
+                #   Shape: [Chunk_Len]
+                #   含义: 这是一个 Token-Level 的分数向量。
+                #   表示当前 Chunk 中每一个 Token 对来自于前文 (External Context) 的依赖程度。
+                #   数值越高，说明该 Token 越需要上下文信息，是 Recompute 的重点候选。
                 CURRENT_CONTEXT["captured_data"][layer_idx][c_hash]["inter_scores_tensor"] = inter_scores_tensor
+
+                # prefix_inter_scores:
+                #   List[float], 长度等于历史 Chunks 的数量。
+                #   含义: 本块对每一个具体历史 Chunk 的关注总分。
+                #   用于计算 Beta Score (衡量对特定历史块的依赖性，用于判断是否需要携带该前缀)。
                 CURRENT_CONTEXT["captured_data"][layer_idx][c_hash]["prefix_inter_scores"] = prefix_inter_scores
     # ========================================================================
 

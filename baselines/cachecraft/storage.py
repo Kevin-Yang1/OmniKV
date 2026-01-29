@@ -45,7 +45,8 @@ class MetadataStore:
         inter_scores_tensor: List[torch.Tensor],
         text: str,
         prefix_hashes: Optional[List[str]] = None,
-        prefix_inter_scores: Optional[List[List[float]]] = None
+        prefix_inter_scores: Optional[List[List[float]]] = None,
+        cci: Optional[float] = None
     ):
         """
         保存 Chunk 数据到存储中。
@@ -60,6 +61,7 @@ class MetadataStore:
             text (str): 原始文本块内容。
             prefix_hashes (Optional[List[str]]): 生成该 Chunk 时的前缀 Hash 列表。
             prefix_inter_scores (Optional[List[List[float]]]): 每层对各前缀块的 inter 分数列表。
+            cci (Optional[float]): 预先计算好的 CCI 分数。
         """
         
         # 1. 处理 KV Cache：移动到 CPU 并分离计算图
@@ -78,7 +80,8 @@ class MetadataStore:
             "inter_scores_tensor": cpu_inter_scores,
             "text": text,
             "prefix_hashes": prefix_hashes or [],
-            "prefix_inter_scores": prefix_inter_scores or []
+            "prefix_inter_scores": prefix_inter_scores or [],
+            "cci": cci
         }
 
     def clear(self):

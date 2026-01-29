@@ -78,8 +78,20 @@ def run_mode(args, mode_name, samples, prompt_template, shared_pipeline, shared_
     os.makedirs(os.path.dirname(output_file), exist_ok=True)
     print(f"Auto-generated output_file: {output_file}")
     
+    # [NEW] 生成 JSONL 格式的测评输出文件
+    # 使用 basename 避免创建多余的子目录
+    dataset_basename = os.path.splitext(os.path.basename(args.data_path))[0]
+    eval_output_dir = os.path.join(base_output_dir, "longbench_eval")
+    os.makedirs(eval_output_dir, exist_ok=True)
+    jsonl_output_file = os.path.join(eval_output_dir, f"{dataset_basename}_{suffix}.jsonl")
+    print(f"JSONL output file for evaluation: {jsonl_output_file}")
+    
     with open(output_file, "w") as f:
         f.write(f"Run Log for Mode: {mode_name} (Fixed Ratio: {fixed_ratio})\n\n")
+    
+    # 初始化 JSONL 输出文件（清空旧内容）
+    with open(jsonl_output_file, "w", encoding="utf-8") as f:
+        pass
 
     # [优化] 使用共享 Pipeline 并动态更新配置
     pipeline = shared_pipeline
@@ -123,6 +135,22 @@ def run_mode(args, mode_name, samples, prompt_template, shared_pipeline, shared_
         
         print(f"\nSample {i+1} Prediction: {pred_answer}")
         print(f"{'='*100}")
+        
+        # [NEW] 计算上下文总长度（用于测评）
+        total_length = sum([
+            len(pipeline.tokenizer(chunk, add_special_tokens=False).input_ids)
+            for chunk in processed_chunks
+        ])
+        
+        # [NEW] 写入 JSONL 格式的测评文件
+        with open(jsonl_output_file, "a", encoding="utf-8") as f:
+            json.dump({
+                "pred": pred_answer.strip(),
+                "answers": sample['answers'],
+                "all_classes": sample.get('all_classes', None),
+                "length": total_length
+            }, f, ensure_ascii=False)
+            f.write('\n')
 
         if output_file:
             # 使用 "a" 模式追加结果 
@@ -137,6 +165,17 @@ def run_mode(args, mode_name, samples, prompt_template, shared_pipeline, shared_
                     f.write(f"Debug Logits: {debug_info.get('logits', 'N/A')}\n")
                     if debug_info.get("recompute_stats") and debug_info["recompute_stats"] != "N/A":
                         f.write(f"[Recompute Stats] {debug_info['recompute_stats']}\n")
+
+                    if debug_info.get("chunk_details"):
+                        f.write("\n[Chunk Details]\n")
+                        for cd in debug_info["chunk_details"]:
+                            tokens_str = str(cd['recomputed_tokens']) if cd.get('recomputed_tokens') else "None"
+                            f.write(f"  Chunk {cd['chunk_idx']}: CCI={cd['cci']}, Beta={cd['beta_prime']}, Ratio={cd['recompute_ratio']}\n")
+                            if cd.get('recomputed_tokens'):
+                                f.write(f"    Indices: {tokens_str}\n")
+
+                    if debug_info.get("deviation_analysis"):
+                        f.write(f"{debug_info['deviation_analysis']}\n")
 
                     # if "attn_analysis" in debug_info:
                     #     f.write(f"{debug_info['attn_analysis']}\n")
@@ -159,10 +198,20 @@ def main():
 
     # [优化] 预先加载模型和 Tokenizer，避免重复加载
     print(f"Loading Base Model: {args.model_path}")
+    
+    # [MODIFIED] 支持多 GPU 推理
+    # 使用 device_map="auto" 自动将模型分布到多个可用 GPU
+    # 这样可以解决单卡显存不足的问题
+    if args.device == "cuda":
+        device_map = "auto"  # 自动分配到多个 GPU
+        print(f"Using multi-GPU with device_map='auto'")
+    else:
+        device_map = args.device
+    
     model = AutoModelForCausalLM.from_pretrained(
         args.model_path,
         torch_dtype=torch.float16, 
-        device_map=args.device,
+        device_map=device_map,
         trust_remote_code=True
     )
     model.eval()

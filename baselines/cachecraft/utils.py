@@ -6,7 +6,8 @@ def compute_layer_scores(
     attn_weights: torch.Tensor,
     curr_start: int,
     curr_end: int,
-    prefix_ranges: List[Tuple[int, int]]
+    prefix_ranges: List[Tuple[int, int]],
+    past_len: int = 0
 ) -> Tuple[float, float]:
     """
     计算单层的归一化注意力得分 a_l(C_i) 和 b_l(C_i)。
@@ -16,12 +17,12 @@ def compute_layer_scores(
         curr_start (int): 当前文档块 C_i 在序列中的起始索引（包含）。
         curr_end (int): 当前文档块 C_i 在序列中的结束索引（不包含）。
         prefix_ranges (List[Tuple[int, int]]): 一个列表，包含所有前缀块 C_j 的 (start, end) 元组（即 j < i 的块）。
-        
+        past_len (int): 过去的上下文长度 (用于块内注意力计算的偏移)。
     Returns:
         Tuple[float, float]: 返回元组 (a_l, b_l)，分别代表归一化的块间注意力和块内注意力得分。
     """
     # 1. 预处理 Attention 权重
-    # attn_weights 形状: (Batch, Num_Heads, Seq_Len, Seq_Len)
+    # attn_weights 形状: [Batch, Num_Heads, Q_Len, KV_Len]
     # 我们假设 Batch Size = 1
     # inter_scores_tensor = inter_sum[0].mean(dim=0) -> 取 batch index 0, 对 heads 求平均
     # 因此这里也应该保持一致：此时我们专注分析第一个样本的 Attention Pattern
@@ -39,6 +40,10 @@ def compute_layer_scores(
     total_normalized_inter = 0.0
     
     for (prev_start, prev_end) in prefix_ranges:
+        # 处理 Attention Sink: 直接排除索引 0 的整个块 (通常包含 Sink Token)
+        if prev_start == 0:
+            continue
+            
         c_j_len = prev_end - prev_start
         if c_j_len <= 0:
             continue
@@ -60,11 +65,11 @@ def compute_layer_scores(
     a_l = total_normalized_inter
     
     # --- B. 计算块内注意力 (Intra-Attention, Eq 4) ---
-    # 逻辑：b_l = intra(C_i) / (|C_i|^2)
+    # 逻辑：b_l = intra(C_i) / (|C_i|^2) -> 修正为除以有效面积
     
     # 提取当前块 C_i 对自身的注意力子矩阵
     # 行列索引均为: [curr_start, curr_end)
-    intra_block = avg_attn[curr_start:curr_end, curr_start:curr_end]
+    intra_block = avg_attn[curr_start:curr_end, past_len+curr_start:past_len+curr_end]
     
     # 应用下三角掩码 (Causal Mask)
     # 只保留 k <= l 的部分（即矩阵的下三角部分，包括对角线）
@@ -75,12 +80,42 @@ def compute_layer_scores(
     # 计算 intra(C_i)：掩码后的子矩阵求和
     intra_score = masked_intra.sum().item()
     
-    # 归一化 (Eq 9 右)：除以当前块长度的平方
-    b_l = intra_score / (c_i_len * c_i_len)
+    # 归一化 (Eq 9 右)：修正为除以有效面积 (mask 中 1 的个数)
+    # 原来除以 c_i_len^2 会导致 b_l 偏小 (因为实际上只有一半是非零的)
+    effective_area = mask.sum().item()
+    if effective_area > 0:
+        b_l = intra_score / effective_area
+    else:
+        b_l = 0.0
     
     return a_l, b_l
 
 def compute_final_cci(layer_scores: List[Tuple[float, float]], epsilon: float = 1e-9) -> float:
+    """
+    聚合所有层的结果计算最终 CCI (Cache Context Impact)。
+    
+    Args:
+        layer_scores (List[Tuple[float, float]]): 一个列表，包含每一层的 (a_l, b_l) 元组。
+        epsilon (float): 防止除零异常的小量。
+
+        Returns:
+        float: 计算得到的 CCI 分数。[0, 1] 范围内，值越大表示该块越依赖上下文。
+    """
+    if not layer_scores:
+        return 0.0
+    
+    # 跨层平均 (Eq 10)
+    # 计算所有层 a_l 的平均值 bar_a
+    a_vals = [s[0] for s in layer_scores]
+    bar_a = sum(a_vals) / len(a_vals)
+    
+    # 计算所有层 b_l 的平均值 bar_b
+    b_vals = [s[1] for s in layer_scores]
+    bar_b = sum(b_vals) / len(b_vals)
+
+    return bar_a/(bar_a + bar_b)
+
+def compute_final_cci_orig(layer_scores: List[Tuple[float, float]], epsilon: float = 1e-9) -> float:
     """
     聚合所有层的结果计算最终 CCI (Cache Context Impact)。
     

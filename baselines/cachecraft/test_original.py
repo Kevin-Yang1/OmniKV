@@ -1,5 +1,9 @@
-# CUDA_VISIBLE_DEVICES=1 python baselines/cachecraft/test_original.py --output_file /NV1/ykw/projects/OmniKV/baselines/cachecraft/output/hotpot_dense_remix_v1/orig_results.txt
+# CUDA_VISIBLE_DEVICES=1 python baselines/cachecraft/test_original.py --output_file baselines/cachecraft/output/hotpot_dense_remix_v1/orig_results.txt
 
+import sys
+from pathlib import Path
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+from scripts.omnikv_config import config
 
 import torch
 import argparse
@@ -22,7 +26,7 @@ def format_context_chunk(context_item):
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--model_path", type=str, default="/NV1/ykw/models/Meta-Llama-3.1-8B-Instruct", help="Path to the model")
+    parser.add_argument("--model_path", type=str, default=config.get_model_path("Meta-Llama-3.1-8B-Instruct"), help="Path to the model")
     parser.add_argument("--data_path", type=str, default="datasets/2WikiMultihopQA_format/2WiKiMQA_dense_remix_v1.json", help="Data path")
     parser.add_argument("--num_samples", type=int, default=None, help="Number of samples to run")
     parser.add_argument("--device", type=str, default="cuda")

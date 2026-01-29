@@ -1,4 +1,9 @@
-# CUDA_VISIBLE_DEVICES=1 PYTHONPATH=. python baselines/cachecraft/run_hotpotqa.py --output_file /NV1/ykw/projects/OmniKV/baselines/cachecraft/output/hotpot_dense_remix_v1/craft_results.txt
+# CUDA_VISIBLE_DEVICES=1 PYTHONPATH=. python baselines/cachecraft/run_hotpotqa.py --output_file baselines/cachecraft/output/hotpot_dense_remix_v1/craft_results.txt
+
+import sys
+from pathlib import Path
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+from scripts.omnikv_config import config
 
 import json
 import argparse
@@ -11,8 +16,8 @@ def parse_args():
     解析命令行参数
     """
     parser = argparse.ArgumentParser(description="在 HotpotQA 数据集上运行 Cache-Craft 基准测试")
-    parser.add_argument("--data_path", type=str, default="/NV1/ykw/projects/OmniKV/datasets/2WikiMultihopQA_format/2WiKiMQA_dense_remix_v1.json", help="数据集路径 (JSON格式)")
-    parser.add_argument("--model_path", type=str, default="/NV1/ykw/models/Meta-Llama-3.1-8B-Instruct", help="HuggingFace 模型路径或名称")
+    parser.add_argument("--data_path", type=str, default=str(config.get_dataset_path("2WikiMultihopQA_format/2WiKiMQA_dense_remix_v1.json")), help="数据集路径 (JSON格式)")
+    parser.add_argument("--model_path", type=str, default=config.get_model_path("Meta-Llama-3.1-8B-Instruct"), help="HuggingFace 模型路径或名称")
     parser.add_argument("--num_samples", type=int, default=None, help="运行测试的样本数量 (用于快速调试)")
     parser.add_argument("--alpha", type=float, default=1.0, help="CFO (Context-Aware Fractional Offloading) 算法的 alpha 参数")
     parser.add_argument("--device", type=str, default="cuda", help="使用的计算设备 (如 cuda, cpu)")
@@ -52,7 +57,7 @@ def main():
     
     # 自动生成输出路径逻辑
     if args.output_file is None:
-        base_output_dir = "/NV1/ykw/projects/OmniKV/baselines/cachecraft/output/"
+        base_output_dir = str(config.output_dir) + "/"
         # 1. 提取数据集名称 (datasets/ 之后的部分路径)
         if "datasets/" in args.data_path:
             relative_path = args.data_path.split("datasets/")[-1]

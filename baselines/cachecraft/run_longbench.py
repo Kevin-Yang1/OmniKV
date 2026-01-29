@@ -3,8 +3,15 @@
 import json
 import argparse
 import os
-import torch
+import sys
+from pathlib import Path
 import random
+import torch
+
+# 添加配置系统
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+from scripts.omnikv_config import config
+
 from baselines.cachecraft.pipeline import CacheCraftPipeline
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
@@ -13,8 +20,8 @@ def parse_args():
     解析命令行参数
     """
     parser = argparse.ArgumentParser(description="在 LongBench 格式数据集上运行 Cache-Craft 基准测试")
-    parser.add_argument("--data_path", type=str, default="/NV1/ykw/projects/OmniKV/datasets/longbench/2wikimqa_e_dense_remix_v1.json", help="数据集路径 (JSON格式)")
-    parser.add_argument("--model_path", type=str, default="/NV1/ykw/models/Meta-Llama-3.1-8B-Instruct", help="HuggingFace 模型路径或名称")
+    parser.add_argument("--data_path", type=str, default=str(config.get_dataset_path("longbench/2wikimqa_e_dense_remix_v1.json")), help="数据集路径 (JSON格式)")
+    parser.add_argument("--model_path", type=str, default=config.get_model_path("Meta-Llama-3.1-8B-Instruct"), help="HuggingFace 模型路径或名称")
     parser.add_argument("--num_samples", type=int, default=None, help="运行测试的样本数量 (用于快速调试)")
     parser.add_argument("--alpha", type=float, default=1.0, help="CFO (Context-Aware Fractional Offloading) 算法的 alpha 参数")
     parser.add_argument("--device", type=str, default="cuda", help="使用的计算设备 (如 cuda, cpu)")
@@ -62,7 +69,7 @@ def run_mode(args, mode_name, samples, prompt_template, shared_pipeline, shared_
         disable_recompute = args.disable_recompute
         
     # 自动生成输出路径逻辑
-    base_output_dir = "/NV1/ykw/projects/OmniKV/baselines/cachecraft/output/"
+    base_output_dir = str(config.output_dir) + "/"
     if "datasets/" in args.data_path:
         relative_path = args.data_path.split("datasets/")[-1]
         dataset_rel_name = os.path.splitext(relative_path)[0]

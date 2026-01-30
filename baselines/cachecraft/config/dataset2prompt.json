@@ -1,3 +1,55 @@
 {
-    "hotpotqa": "The following are given passages.\n{context}\n\nQuestion: {input}"
+    "hotpotqa": {
+        "field_mapping": {
+            "question": "question",
+            "context": "context",
+            "answer": "answer"
+        },
+        "context_format": "title_paragraphs",
+        "templates": {
+            "answer_only": {
+                "system": "You are a helpful assistant. Your job is to answer questions based on the given paragraph. Answer the question asconcisely as you can, using a single phrase if possible. No need to explain the reasoning or include any other information.",
+                "user": "Answer the question based on the given passages. Only give me the answer and do not output any other words.\n\nThe following are given passages.\n{context}\n\nAnswer the question based on the given passages. Only give me the answer and do not output any other words.\n\nQuestion: {input}\nAnswer:"
+            },
+            "with_reasoning": {
+                "system": "You are a helpful assistant. Answer questions based on the given context and explain your reasoning.",
+                "user": "The following are given passages.\n{context}\n\nQuestion: {input}\n\nPlease provide your answer and explain your reasoning."
+            }
+        },
+        "default_template": "answer_only"
+    },
+    "longbench": {
+        "field_mapping": {
+            "question": "input",
+            "context": "context",
+            "answer": "answers"
+        },
+        "context_format": "plain_list",
+        "templates": {
+            "answer_only": {
+                "system": "You are a helpful assistant. Your job is to answer questions based on the given paragraph. Answer the question asconcisely as you can, using a single phrase if possible. No need to explain the reasoning or include any other information.",
+                "user": "Answer the question based on the context.\n\nContext:\n{context}\n\nQuestion: {input}\nAnswer:"
+            },
+            "with_reasoning": {
+                "system": "You are a helpful assistant. Answer questions based on the given context and explain your reasoning.",
+                "user": "Context:\n{context}\n\nQuestion: {input}\n\nPlease provide your answer and explain your reasoning."
+            }
+        },
+        "default_template": "answer_only"
+    },
+    "2wikimqa": {
+        "field_mapping": {
+            "question": "input",
+            "context": "context",
+            "answer": "answers"
+        },
+        "context_format": "plain_list",
+        "templates": {
+            "answer_only": {
+                "system": "You are a helpful assistant. Your job is to answer questions based on the given paragraph. Answer the question asconcisely as you can, using a single phrase if possible. No need to explain the reasoning or include any other information.",
+                "user": "Answer the question based on the given passages. Only give me the answer and do not output any other words.\n\nThe following are given passages.\n{context}\n\nAnswer the question based on the given passages. Only give me the answer and do not output any other words.\n\nQuestion: {input}\nAnswer:"
+            }
+        },
+        "default_template": "answer_only"
+    }
 }

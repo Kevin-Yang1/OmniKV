@@ -112,7 +112,7 @@ class CacheCraftPipeline:
         return hashlib.md5(text.encode('utf-8')).hexdigest()
 
     @torch.no_grad()
-    def generate(self, chunks: List[str], question: str, prompt_template: str = None):
+    def generate(self, chunks: List[str], question: str, prompt_template: str = None, system_prompt: str = None):
         """
         统一的生成入口。
         实现完整的 RAG 混合流水线 (Cache-Craft)：
@@ -154,8 +154,9 @@ class CacheCraftPipeline:
         current_prefix_meta = []
 
         # --- Phase 0: 模板解析与前缀编码 (集成 Chat Template) ---
-        # 定义 System Prompt (参考 test_original.py 为解决重复输出问题)
-        system_prompt = "You are a helpful assistant. Your job is to answer questions based on the given paragraph. Just provide the answer within 5 words. No need to explain the reasoning or include any other information."
+        # 使用传入的 system_prompt，如果未提供则使用默认值
+        if system_prompt is None:
+            system_prompt = "You are a helpful assistant. Your job is to answer questions based on the given paragraph. Just provide the answer within 5 words. No need to explain the reasoning or include any other information."
         context_placeholder = "___CONTEXT_PLACEHOLDER___"
         
         # 1. 构造 User Content
@@ -180,8 +181,7 @@ class CacheCraftPipeline:
                 messages, tokenize=False, add_generation_prompt=True
             )
         else:
-            print("Chat Template not available or not set. Using raw template.")
-            full_prompt_str = user_content
+            raise ValueError("Chat Template not available or not set. Requires a chat template for consistent tokenization.")
 
         # 3. 分割前缀和后缀
         # 注意: apply_chat_template 可能会保留我们在 user_content 里加的空格
@@ -225,8 +225,8 @@ class CacheCraftPipeline:
             native_slice = []
             split_slice = []
             if diff_idx != -1:
-                native_slice = full_tokens[diff_idx:diff_idx+5]
-                split_slice = split_tokens_concat[diff_idx:diff_idx+5]
+                native_slice = full_tokens[diff_idx:diff_idx+10]
+                split_slice = split_tokens_concat[diff_idx:diff_idx+10]
                 context_snippet = repr(self.tokenizer.decode(full_tokens[max(0, diff_idx-2):diff_idx+2]))
 
             raise ValueError(

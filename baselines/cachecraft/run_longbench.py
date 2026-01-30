@@ -13,6 +13,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from scripts.omnikv_config import config
 
 from baselines.cachecraft.pipeline import CacheCraftPipeline
+from baselines.cachecraft.dataset_config import DatasetConfig, auto_detect_dataset
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
 def parse_args():
@@ -23,13 +24,13 @@ def parse_args():
     parser.add_argument("--data_path", type=str, default=str(config.get_dataset_path("longbench/2wikimqa_e_dense_remix_v1.json")), help="数据集路径 (JSON格式)")
     parser.add_argument("--model_path", type=str, default=config.get_model_path("Meta-Llama-3.1-8B-Instruct"), help="HuggingFace 模型路径或名称")
     parser.add_argument("--num_samples", type=int, default=None, help="运行测试的样本数量 (用于快速调试)")
-    parser.add_argument("--alpha", type=float, default=1.0, help="CFO (Context-Aware Fractional Offloading) 算法的 alpha 参数")
+    parser.add_argument("--alpha", type=float, default=3.0, help="CFO (Context-Aware Fractional Offloading) 算法的 alpha 参数")
     parser.add_argument("--device", type=str, default="cuda", help="使用的计算设备 (如 cuda, cpu)")
     parser.add_argument("--disable_caching", action="store_true", help="禁用 KV 缓存功能 (MetadataStore)")
     parser.add_argument("--disable_recompute", action="store_true", help="禁用命中块的 token 重算，仅直接复用 KV")
     parser.add_argument("--shuffle_chunks", action="store_true", help="打乱 chunks 中的文档顺序")
     parser.add_argument("--run_all_modes", action="store_true", help="一次运行所有三种模式 (nocache, norecompute, recompute)")
-    parser.add_argument("--recompute_ratios", type=float, nargs='+', default=None, help="重算比例列表，例如: 0.1 0.3 0.5。启用此项将测试一系列固定比例")
+    parser.add_argument("--recompute_ratios", type=float, nargs='*', default=None, help="重算比例列表，例如: 0.1 0.3 0.5。不带参数时使用默认值 [0.1, 0.3, 0.5]")
     parser.add_argument("--output_file", type=str, default=None, help="输出文件路径")
     return parser.parse_args()
 
@@ -43,7 +44,7 @@ def load_data(path, num_samples):
     print(f"Total samples: {len(data)}")
     return data[:num_samples]
 
-def run_mode(args, mode_name, samples, prompt_template, shared_pipeline, shared_ground_truth=None, fixed_ratio=None):
+def run_mode(args, mode_name, samples, shared_pipeline, shared_ground_truth=None, fixed_ratio=None):
     print(f"\n{'#'*40}")
     print(f"Running Mode: {mode_name} (Ratio: {fixed_ratio if fixed_ratio is not None else 'Auto/CFO'})")
     print(f"{'#'*40}\n")
@@ -114,31 +115,51 @@ def run_mode(args, mode_name, samples, prompt_template, shared_pipeline, shared_
         record_ground_truth=record_gt
     )
     
+    # 初始化配置系统
+    dataset_cfg = DatasetConfig()
+    
+    # 尝试自动检测数据集类型，默认使用 longbench
+    dataset_name = auto_detect_dataset(args.data_path)
+    if dataset_name is None:
+        dataset_name = "longbench"
+        print(f"Cannot auto-detect dataset, using default: {dataset_name}")
+    else:
+        print(f"Auto-detected dataset: {dataset_name}")
+    
+    # 获取提示词模板
+    system_prompt, user_template = dataset_cfg.get_template(dataset_name)
+    
     # 逐个样本处理
     for i, sample in enumerate(samples):
         print(f"\n{'='*50} Processing Sample {i+1}/{len(samples)} {'='*50}")
-        question = sample['input']  # LongBench 格式使用 'input'
-        golden_answer = sample['answers'][0] if isinstance(sample['answers'], list) else sample['answers']
+        
+        # 使用配置系统提取字段
+        fields = dataset_cfg.extract_fields(sample, dataset_name)
+        question = fields["question"]
+        golden_answer = fields["answer"]
         
         print(f"Question: {question}")
         print(f"Golden Answer: {golden_answer}")
         
-        # 确保每个 chunk 以 \n\n 结尾，以保证 token 分隔的一致性，防止边界合并
-        # 注意：这里我们生成一个新的 list，不修改原 sample
-        processed_chunks = []
-        source_chunks = list(sample['context']) # 创建副本
+        # 使用配置系统格式化 context
+        source_chunks = dataset_cfg.format_context(fields["context"], dataset_name)
         
         if args.shuffle_chunks:
             print("Shuffling chunks order...")
             random.seed(42)
             random.shuffle(source_chunks)
-            
-        processed_chunks = [c if c.endswith("\n\n") else (c + "\n\n" if c.endswith("\n") else c + "\n\n") for c in source_chunks]
+        
+        processed_chunks = source_chunks  # 已经由配置系统格式化
         print(f"Number of chunks: {len(processed_chunks)}")
         
         # 统一生成接口
         print("\n[Phase 1 & 2] Unified Generation with Cache Craft...")
-        pred_answer, debug_info = pipeline.generate(processed_chunks, question=question, prompt_template=prompt_template)
+        pred_answer, debug_info = pipeline.generate(
+            processed_chunks, 
+            question=question, 
+            prompt_template=user_template,
+            system_prompt=system_prompt
+        )
         
         print(f"\nSample {i+1} Prediction: {pred_answer}")
         print(f"{'='*100}")
@@ -153,7 +174,7 @@ def run_mode(args, mode_name, samples, prompt_template, shared_pipeline, shared_
         with open(jsonl_output_file, "a", encoding="utf-8") as f:
             json.dump({
                 "pred": pred_answer.strip(),
-                "answers": sample['answers'],
+                "answers": [golden_answer] if isinstance(golden_answer, str) else golden_answer,
                 "all_classes": sample.get('all_classes', None),
                 "length": total_length
             }, f, ensure_ascii=False)
@@ -191,15 +212,6 @@ def run_mode(args, mode_name, samples, prompt_template, shared_pipeline, shared_
 def main():
     args = parse_args()
     
-    # 加载 Prompt 模板
-    config_path = os.path.join(os.path.dirname(__file__), "config/dataset2prompt.json")
-    prompt_template = None
-    if os.path.exists(config_path):
-        with open(config_path, "r") as f:
-            templates = json.load(f)
-            # 默认使用通用或根据数据集名称匹配
-            prompt_template = templates.get("longbench", templates.get("hotpotqa", None))
-
     # 加载测试数据 (只加载一次)
     samples = load_data(args.data_path, args.num_samples)
 
@@ -224,7 +236,7 @@ def main():
     model.eval()
     tokenizer = AutoTokenizer.from_pretrained(args.model_path)
     
-    shared_gt = {} if (args.run_all_modes or args.recompute_ratios) else None
+    shared_gt = {} if (args.run_all_modes or args.recompute_ratios is not None) else None
     
     # 初始化共享的 Pipeline 实例
     shared_pipeline = CacheCraftPipeline(
@@ -241,7 +253,7 @@ def main():
     if args.run_all_modes:
         modes = ["nocache", "norecompute", "recompute"]
         for mode in modes:
-            run_mode(args, mode, samples, prompt_template, shared_pipeline, shared_ground_truth=shared_gt)
+            run_mode(args, mode, samples, shared_pipeline, shared_ground_truth=shared_gt)
     elif shared_gt is not None:
         pass
     else:
@@ -252,16 +264,18 @@ def main():
             mode = "norecompute"
         else:
             mode = "recompute"
-        run_mode(args, mode, samples, prompt_template, shared_pipeline)
+        run_mode(args, mode, samples, shared_pipeline)
 
     # 2. 运行扩充的固定比例模式
-    if args.recompute_ratios:
-        print(f"\n[Extended Test] Running fixed recompute ratios: {args.recompute_ratios}")
+    if args.recompute_ratios is not None:
+        # 如果用户指定了 --recompute_ratios 但没给值，使用默认值
+        ratios = args.recompute_ratios if args.recompute_ratios else [0.1, 0.3, 0.5]
+        print(f"\n[Extended Test] Running fixed recompute ratios: {ratios}")
         
-        for ratio in args.recompute_ratios:
+        for ratio in ratios:
             ratio_val = float(ratio)
             mode_name = f"recompute_ratio_{ratio_val}"
-            run_mode(args, mode_name, samples, prompt_template, shared_pipeline, shared_ground_truth=shared_gt, fixed_ratio=ratio_val)
+            run_mode(args, mode_name, samples, shared_pipeline, shared_ground_truth=shared_gt, fixed_ratio=ratio_val)
 
 if __name__ == "__main__":
     main()

@@ -84,9 +84,9 @@
             },
             "args": [
                 "--model_path",
-                "/NV1/ykw/models/Meta-Llama-3.1-8B-Instruct",
+                "/data/ykw/model/Llama-3.1-8B-Instruct",
                 "--data_path",
-                "/NV1/ykw/projects/OmniKV/datasets/longbench/2wikimqa_e_dense_remix_v1.json",
+                "/data/ykw/projects/OmniKV/datasets/longbench/2wikimqa_e_dense_remix_v1.json",
                 "--alpha",
                 "1.0",
                 "--shuffle_chunks",
@@ -113,6 +113,31 @@
                 "1",
                 "--task",
                 "narrativeqa"
+            ],
+            "justMyCode": false
+        },
+        {
+            "name": "Debug CacheCraft NarrativeQA RAG (All Modes + Ratios)",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${workspaceFolder}/baselines/cachecraft/run_longbench.py",
+            "console": "integratedTerminal",
+            "cwd": "${workspaceFolder}",
+            "env": {
+                "PYTHONPATH": "${workspaceFolder}",
+                "CUDA_VISIBLE_DEVICES": "1"
+            },
+            "args": [
+                "--model_path",
+                "/data/ykw/model/Llama-3.1-8B-Instruct",
+                "--data_path",
+                "/data/ykw/projects/OmniKV/datasets/longbench/narrativeqa_rag/narrativeqa_rag_k10.json",
+                "--recompute_ratios",
+                "--run_all_modes"
+                // 取消注释以覆盖默认的recompute_ratios [0.1, 0.3, 0.5]
+                // "--recompute_ratios", "0.2", "0.5"
+                // 取消注释以限制样本数量进行快速测试
+                // "--num_samples", "10"
             ],
             "justMyCode": false
         }

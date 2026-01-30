@@ -3,7 +3,7 @@ NarrativeQA RAG Dataset Converter
 将 narrativeqa.json 转换为 RAG 格式数据集
 
 使用方法:
-    python create_narrativeqa_rag.py --input datasets/longbench/narrativeqa.json \
+    python scripts/rag/create_narrativeqa_rag.py --input datasets/longbench/narrativeqa.json \
                                      --output datasets/longbench/narrativeqa_rag \
                                      --k 10 \
                                      --chunk_size 1000 \
@@ -41,13 +41,23 @@ class NarrativeQARAGConverter:
         self.chunk_size = chunk_size
         self.overlap = overlap
         self.device = device
+        self.model_name = model_name  # 保存模型名称供后续使用
         
         print(f"Loading embedding model: {model_name}")
-        self.tokenizer = AutoTokenizer.from_pretrained(model_name)
-        self.model = AutoModel.from_pretrained(model_name, trust_remote_code=True)
-        self.model = self.model.to(device)
+        # 使用 device_map='auto' 自动分配到多GPU（参考 HippoRAG 实现）
+        self.model = AutoModel.from_pretrained(
+            model_name, 
+            trust_remote_code=True,
+            device_map='auto',  # 自动分配到多个GPU
+            torch_dtype=torch.float16  # 使用半精度减少显存
+        )
         self.model.eval()
         print("Model loaded successfully")
+        
+        # 检测GPU数量
+        num_gpus = torch.cuda.device_count()
+        if num_gpus > 1:
+            print(f"Model distributed across {num_gpus} GPUs automatically")
         
     def extract_unique_contexts(self, data: List[Dict]) -> Dict[str, Dict]:
         """
@@ -270,37 +280,66 @@ class NarrativeQARAGConverter:
     def get_embeddings(self, texts: List[str], batch_size: int = 32, desc: str = "Embedding") -> torch.Tensor:
         """
         获取文本的向量嵌入
+        优先使用模型的 encode() 方法（如 NV-Embed-v2），否则回退到手动处理
         
         Returns:
             Tensor of shape (len(texts), embedding_dim)
         """
-        embeddings = []
+        # 检查模型是否有 encode 方法（NV-Embed-v2 等有优化的 encode）
+        if hasattr(self.model, 'encode'):
+            print(f"Using model's native encode() method for {len(texts)} texts")
+            embeddings = []
+            
+            for i in tqdm(range(0, len(texts), batch_size), desc=desc):
+                batch_texts = texts[i:i+batch_size]
+                batch_emb = self.model.encode(
+                    prompts=batch_texts,
+                    max_length=512,
+                    instruction=""  # NV-Embed-v2 支持 instruction
+                )
+                if isinstance(batch_emb, torch.Tensor):
+                    embeddings.append(batch_emb.cpu())
+                else:
+                    embeddings.append(torch.from_numpy(batch_emb))
+            
+            return torch.cat(embeddings, dim=0)
         
-        for i in tqdm(range(0, len(texts), batch_size), desc=desc):
-            batch_texts = texts[i:i+batch_size]
+        else:
+            # 回退到手动 tokenization（适用于没有 encode 方法的模型）
+            print(f"Using manual tokenization for {len(texts)} texts")
+            from transformers import AutoTokenizer
+            tokenizer = AutoTokenizer.from_pretrained(self.model_name, trust_remote_code=True)
             
-            # Tokenize
-            inputs = self.tokenizer(
-                batch_texts,
-                padding=True,
-                truncation=True,
-                max_length=512,
-                return_tensors='pt'
-            )
-            inputs = {k: v.to(self.device) for k, v in inputs.items()}
+            embeddings = []
+            for i in tqdm(range(0, len(texts), batch_size), desc=desc):
+                batch_texts = texts[i:i+batch_size]
+                
+                # Tokenize
+                inputs = tokenizer(
+                    batch_texts,
+                    padding=True,
+                    truncation=True,
+                    max_length=512,
+                    return_tensors='pt'
+                )
+                
+                # 自动放到正确的设备（device_map='auto' 会处理）
+                # 获取模型第一个参数所在的设备
+                first_device = next(self.model.parameters()).device
+                inputs = {k: v.to(first_device) for k, v in inputs.items()}
+                
+                # Get embeddings
+                outputs = self.model(**inputs)
+                
+                # Mean pooling
+                attention_mask = inputs['attention_mask']
+                token_embeddings = outputs.last_hidden_state
+                input_mask_expanded = attention_mask.unsqueeze(-1).expand(token_embeddings.size()).float()
+                batch_embeddings = torch.sum(token_embeddings * input_mask_expanded, 1) / torch.clamp(input_mask_expanded.sum(1), min=1e-9)
+                
+                embeddings.append(batch_embeddings.cpu())
             
-            # Get embeddings
-            outputs = self.model(**inputs)
-            
-            # Mean pooling
-            attention_mask = inputs['attention_mask']
-            token_embeddings = outputs.last_hidden_state
-            input_mask_expanded = attention_mask.unsqueeze(-1).expand(token_embeddings.size()).float()
-            batch_embeddings = torch.sum(token_embeddings * input_mask_expanded, 1) / torch.clamp(input_mask_expanded.sum(1), min=1e-9)
-            
-            embeddings.append(batch_embeddings.cpu())
-        
-        return torch.cat(embeddings, dim=0)
+            return torch.cat(embeddings, dim=0)
     
     def embed_chunks(self, chunks: List[Dict]) -> torch.Tensor:
         """嵌入所有 chunks"""
@@ -366,6 +405,9 @@ class NarrativeQARAGConverter:
             
             retrieved_chunks = [chunks[i]['text'] for i in top_k_indices]
             
+            # 获取这些chunks来自哪些文档
+            context_ids = [chunks[i]['context_id'] for i in top_k_indices]
+            
             # 计算新的总长度
             new_length = sum(len(chunk) for chunk in retrieved_chunks)
             
@@ -383,7 +425,8 @@ class NarrativeQARAGConverter:
                     'original_length': sample['length'],
                     'retrieval_k': k,
                     'chunk_scores': top_k_scores,
-                    'chunk_indices': top_k_indices
+                    'chunk_indices': top_k_indices,
+                    'context_ids': context_ids  # 新增：记录chunks来自的文档ID
                 }
             }
             
@@ -399,9 +442,9 @@ def main():
     parser.add_argument('--k', type=int, default=10, help='Number of chunks to retrieve')
     parser.add_argument('--chunk_size', type=int, default=1000, help='Chunk size in characters')
     parser.add_argument('--overlap', type=int, default=200, help='Overlap size in characters')
-    parser.add_argument('--model', type=str, default='nvidia/NV-Embed-v2', help='Embedding model')
+    parser.add_argument('--model', type=str, default='Qwen/Qwen3-Embedding-4B', help='Embedding model')
     parser.add_argument('--device', type=str, default='cuda', help='Device (cuda/cpu)')
-    parser.add_argument('--batch_size', type=int, default=32, help='Batch size for embedding')
+    parser.add_argument('--batch_size', type=int, default=4, help='Batch size for embedding (reduce if OOM)')
     
     args = parser.parse_args()
     

@@ -10,6 +10,7 @@ import argparse
 import os
 import torch
 from baselines.cachecraft.pipeline import CacheCraftPipeline
+from baselines.cachecraft.dataset_config import DatasetConfig
 
 def parse_args():
     """
@@ -35,22 +36,6 @@ def load_data(path, num_samples):
         data = json.load(f)
     print(f"Total samples: {len(data)}")
     return data[:num_samples]
-
-def format_context_chunk(context_item):
-    """
-    将 HotpotQA 的上下文条目格式化为文本 Chunk。
-    
-    Args:
-        context_item: [标题, [句子1, 句子2, ...]]
-        
-    Returns:
-        Formatted string: "Title: ... \n Content: ..."
-    """
-    title = context_item[0]
-    sentences = context_item[1]
-    # 格式化:Title + 正文句子拼接
-    text = f"Title: {title}\n" + "".join(sentences) + "\n\n"
-    return text
 
 def main():
     args = parse_args()
@@ -81,16 +66,13 @@ def main():
 
     # 检查模型路径是否存在（略过详细检查，假设用户提供路径正确）
     
-    # 加载 Prompt 模板
-    # 尝试从 baselines/cachecraft/config/dataset2prompt.json 加载 "hotpotqa" 的专用模板
-    config_path = os.path.join(os.path.dirname(__file__), "config/dataset2prompt.json")
-    prompt_template = None
-    if os.path.exists(config_path):
-        with open(config_path, "r") as f:
-            templates = json.load(f)
-            prompt_template = templates.get("hotpotqa", None)
-            if prompt_template:
-                print(f"Loaded prompt template for hotpotqa")
+    # 初始化配置系统
+    dataset_cfg = DatasetConfig()
+    dataset_name = "hotpotqa"
+    
+    # 获取提示词模板
+    system_prompt, user_template = dataset_cfg.get_template(dataset_name)
+    print(f"Loaded templates for {dataset_name}")
 
     # 初始化 CacheCraft Pipeline
     # 这将加载模型并应用 Monkey Patch
@@ -108,22 +90,27 @@ def main():
     # 逐个样本处理
     for i, sample in enumerate(samples):
         print(f"\n{'='*30} Processing Sample {i+1}/{len(samples)} {'='*30}")
-        question = sample['question']
-        print(f"Question: {question}")
-        print(f"Golden Answer: {sample['answer']}")
         
-        # 准备文档块 (Chunks)
-        # HotpotQA sample['context'] 是一个列表，每个元素是一篇文档
-        chunks = []
-        for ctx in sample['context']:
-            chunk_text = format_context_chunk(ctx)
-            chunks.append(chunk_text)
-            
+        # 使用配置系统提取字段
+        fields = dataset_cfg.extract_fields(sample, dataset_name)
+        question = fields["question"]
+        golden_answer = fields["answer"]
+        
+        print(f"Question: {question}")
+        print(f"Golden Answer: {golden_answer}")
+        
+        # 使用配置系统格式化 context
+        chunks = dataset_cfg.format_context(fields["context"], dataset_name)
         print(f"Number of chunks: {len(chunks)}")
         
         # 统一生成接口：处理 Hit/Miss，自动 Capture
         print("\n[Phase 1 & 2] Unified Generation with Cache Craft...")
-        pred_answer = pipeline.generate(chunks, question=question, prompt_template=prompt_template)
+        pred_answer, debug_info = pipeline.generate(
+            chunks, 
+            question=question, 
+            prompt_template=user_template,
+            system_prompt=system_prompt
+        )
         
         print(f"\nSample {i+1} Prediction: {pred_answer}")
         print(f"{'='*70}")
@@ -132,7 +119,7 @@ def main():
             with open(args.output_file, "a") as f:
                 f.write(f"==================== Processing Sample {i+1}/{len(samples)} ====================\n")
                 f.write(f"Question: {question}\n")
-                f.write(f"Golden Answer: {sample['answer']}\n")
+                f.write(f"Golden Answer: {golden_answer}\n")
                 f.write(f"Generating Answer: {pred_answer.strip()}\n\n")
 
 if __name__ == "__main__":
